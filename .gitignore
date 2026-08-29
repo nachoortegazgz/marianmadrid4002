@@ -1,12 +1,10 @@
-# dependencies
 node_modules/
-.vscode/
-.idea/
-.wix/
-jsconfig.json
+.env
+.env.*
 
 # Local Git transport files
 *.bundle
 *.bundle.b64.txt
-/marianmadrid4002/
+
+# Accidental nested project copy
 /marianmadrid4002/
