@@ -4,3 +4,8 @@ node_modules/
 .idea/
 .wix/
 jsconfig.json
+
+# Local Git transport files
+*.bundle
+*.bundle.b64.txt
+/marianmadrid4002/
