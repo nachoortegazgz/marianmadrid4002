@@ -2,10 +2,14 @@
 =============================================================================
 MODULE: backend/internalConfig.js
 VERSION: marianmadrid4001 (v20.1.2-canonical-unified-ssot)
+RESPONSIBILITY: Single Source of Truth for all backend configuration:
+            collection IDs, app IDs, SDK settings, concurrency limits,
+            cache TTLs, enums, and feature flags.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
 export const COLLECTIONS = Object.freeze({
+    // Catalogo Comercial y Personal (Nombre Visible === ID Tecnico)
     SERVICIOS_RESERVA: "SERVICIOS_RESERVA",
     SERVICIOS_CITA: "SERVICIOS_RESERVA",
     ADDONS_CATALOGO: "ADDONS_CATALOGO",
@@ -14,12 +18,16 @@ export const COLLECTIONS = Object.freeze({
     MAPA_STAFF: "MAPA_STAFF",
     CATEGORIAS_SERVICIO: "CATEGORIAS_SERVICIO",
     LOCALIZACIONES_SALON: "LOCALIZACIONES_SALON",
+
+    // Inventario y Productos
     INVENTARIO_PRODUCTO: "INVENTARIO_PRODUCTO",
     INVENTARIO_PRODUCTOS: "INVENTARIO_PRODUCTO",
     PRODUCTOS_VENTA: "PRODUCTOS_VENTA",
     MOVIMIENTO_INVENTARIO: "movimientoInventario",
     CONCILIACION_STOCK_WIX: "ConciliacionStockWix",
     PROVEEDORES_INVENTARIO: "ProveedoresInventario",
+
+    // Motor de Reservas y Concurrencia
     DUAL_CACHE: "DualSlotCache",
     DAYS_CACHE: "AvailabilityDaysCache",
     SLOTS_CACHE: "AvailabilitySlotsCache",
@@ -27,16 +35,24 @@ export const COLLECTIONS = Object.freeze({
     TRANSACTIONS: "BookingTransactions",
     LOCKS: "MM_LOCKS",
     COMPENSATIONS: "PendingCompensations",
+
+    // Caja, TPV y Facturacion
     MOVIMIENTOS_CAJA: "movimientoCaja",
     CAJA_ACTUAL: "cajaActual",
     HISTORICO_CIERRES_Z: "HISTORICOCIERRESZ",
     CONTEOS_X: "RESUMENCONTEO_X",
     CONTADORES_FISCALES: "SecuenciaTickets",
+
+    // Personal y Control Horario
     REGISTRO_HORARIO: "REGISTROHORARIO",
+
+    // Logs, Auditoria y Sincronizacion
     AUDIT_LOG: "MMAUDIT_LOG",
     SYNC_LOG: "m365SyncLog",
     BOOKINGS_SERVICE_SYNC_QUEUE: "BookingsServiceSyncQueue",
     M365_GRAPH_SYNC_QUEUE: "M365GraphSyncQueue",
+
+    // Fiscalidad AEAT / Veri*Factu y Contabilidad
     CONFIGURACION_FISCAL: "CONFIGURACIONFISCAL",
     EVENTOS_SISTEMA_FACTURACION: "EVENTOSSISTEMAFACTURACION",
     LIBRO_IVA_FACTURAS_EXPEDIDAS: "LIBROIVAFACTURASEXPEDIDAS",
@@ -49,6 +65,7 @@ export const COLLECTIONS = Object.freeze({
     PLAN_CUENTAS_CONTABLES: "PLANCUENTASCONTABLES",
     MAYOR_CONTABLE_SALDOS: "MAYORCONTABLESALDOS",
 });
+
 export const APP_IDS = Object.freeze({
     BOOKINGS: "13d21c63-b5ec-5912-8397-c3a5ddb27a97",
     STORES: "1380b703-ce81-ff05-f115-39571d94eab3",
@@ -58,6 +75,7 @@ export const APP_IDS = Object.freeze({
     MEMBERS_AREA: "14cc59bc-f0b7-15b8-e1c7-89ce41d0e0c9",
     GIFT_CARDS: "d80111c5-a0f4-47a8-b63a-65b54d774a27",
 });
+
 export const SDK_CONFIG = Object.freeze({
     TZ: "Europe/Madrid",
     LOCATION_ID: "7a12abfd-bf30-4847-bcdf-00dc573d4802",
@@ -127,10 +145,12 @@ export const SDK_CONFIG = Object.freeze({
         MAX_EMAIL_SEND_ATTEMPTS: 3,
     }),
 });
+
 export const RATE_LIMIT = SDK_CONFIG.RATE_LIMIT;
 export const CACHE = SDK_CONFIG.CACHE;
 export const TIMEOUTS = SDK_CONFIG.TIMEOUTS;
 export const JOBS = SDK_CONFIG.JOBS;
+
 export const CONCURRENCY = Object.freeze({
     MUTEX_TTL_MS: 120000,
     HEARTBEAT_MS: 15000,
@@ -140,18 +160,22 @@ export const CONCURRENCY = Object.freeze({
     MAX_COMPENSATION_RETRIES: 3,
     LEDGER_MUTEX_TTL_MS: 45000,
 });
+
 export const SLOT_SEARCH = Object.freeze({
     DIAS_LIMITE: 14,
     TOLERANCE_MINUTES: 10,
 });
+
 export const API = Object.freeze({
     STAFF_RESOURCE_TYPE_ID: "1cd44cf8-756f-41c3-bd90-3e2ffcaf1155",
     MARIAN_MANAGEMENT_RESOURCE_ID: "e556070a-6d6a-402e-8422-11133033ea76",
 });
+
 export const STAFF_ACCESS = Object.freeze({
     ALLOWED_ROLES: ["ADMIN", "GESTION", "ESTILISTA"],
     MARIAN_RESOURCE_ID: "e556070a-6d6a-402e-8422-11133033ea76",
 });
+
 export const TIPO_FICHAJE = Object.freeze({
     ENTRADA: "ENTRADA",
     SALIDA: "SALIDA",
@@ -159,6 +183,7 @@ export const TIPO_FICHAJE = Object.freeze({
     PAUSA_FIN: "PAUSA_FIN",
     AJUSTE: "AJUSTE",
 });
+
 export const TIPO_MOVIMIENTO = Object.freeze({
     VENTA_EFECTIVO: "VENTA_EFECTIVO",
     VENTA_TARJETA: "VENTA_TARJETA",
@@ -168,25 +193,30 @@ export const TIPO_MOVIMIENTO = Object.freeze({
     AJUSTE: "AJUSTE",
     PROPINA: "PROPINA",
 });
+
 export const FORMA_PAGO = Object.freeze({
     EFECTIVO: "EFECTIVO",
     TARJETA: "TARJETA",
     BIZUM: "BIZUM",
     ONLINE: "ONLINE",
 });
+
 export const IVA_RATES = Object.freeze({ GENERAL: 0.21 });
 export const CAJA_STATUS = Object.freeze({ OPEN: "ABIERTA", CLOSED: "CERRADA" });
 export const SINGLETONS = Object.freeze({ CAJA: "CAJA_PRINCIPAL" });
+
 export const CITA_FIELDS = Object.freeze({
     STATUS: "status",
     STATUS_PAGO: "statusPago",
 });
+
 export const ESTADO_CITA = Object.freeze({
     CONFIRMED: "CONFIRMED",
     PENDING_PAYMENT: "PENDING_PAYMENT",
     CANCELED: "CANCELED",
     REFUNDED: "REFUNDED",
 });
+
 export const ESTADO_PAGO = Object.freeze({
     UNPAID: "UNPAID",
     PENDING_PAYMENT: "PENDING_PAYMENT",
@@ -195,15 +225,18 @@ export const ESTADO_PAGO = Object.freeze({
     REFUNDED: "REFUNDED",
     PARTIALLY_REFUNDED: "PARTIALLY_REFUNDED",
 });
+
 export const COLLAB_ROLES = Object.freeze({
     ADMIN: "ADMIN",
     GESTION: "GESTION",
     ESTILISTA: "ESTILISTA",
 });
+
 export const JWT = Object.freeze({
     ALGORITHM: "HS256",
     EXPIRATION_MS: 1800000,
 });
+
 export const SERVICE_CATALOG = Object.freeze({
     CURRENCY: "EUR",
     STATES: ["ACTIVO", "INACTIVO", "BORRADOR"],
