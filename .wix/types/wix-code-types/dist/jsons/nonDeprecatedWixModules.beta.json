@@ -1,0 +1,18 @@
+{
+	"page": [
+		"wix-animations-frontend"
+	],
+	"backend": [
+		"wix-configs-backend",
+		"wix-http-functions",
+		"wix-router",
+		"wix-web-module"
+	],
+	"public": [
+		"wix-animations-frontend",
+		"wix-configs-backend",
+		"wix-http-functions",
+		"wix-router",
+		"wix-web-module"
+	]
+}
