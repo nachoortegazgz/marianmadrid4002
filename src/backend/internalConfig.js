@@ -1,33 +1,35 @@
 /*
 =============================================================================
 MODULE: backend/internalConfig.js
-VERSION: marianmadrid4001 (v20.1.2-canonical-unified-ssot)
+VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-unified-ssot)
 RESPONSIBILITY: Single Source of Truth for all backend configuration:
             collection IDs, app IDs, SDK settings, concurrency limits,
             cache TTLs, enums, and feature flags.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
+
 export const COLLECTIONS = Object.freeze({
-    // Catalogo Comercial y Personal (Nombre Visible === ID Tecnico)
     SERVICIOS_RESERVA: "SERVICIOS_RESERVA",
+    /** @deprecated Usar COLLECTIONS.SERVICIOS_RESERVA */
     SERVICIOS_CITA: "SERVICIOS_RESERVA",
     ADDONS_CATALOGO: "ADDONS_CATALOGO",
+    /** @deprecated Usar COLLECTIONS.ADDONS_CATALOGO */
     EXTRAS_CATALOGO: "ADDONS_CATALOGO",
+    /** @deprecated Usar COLLECTIONS.ADDONS_CATALOGO */
     SERVICIOS_OPCIONES_ADDON: "ADDONS_CATALOGO",
     MAPA_STAFF: "MAPA_STAFF",
     CATEGORIAS_SERVICIO: "CATEGORIAS_SERVICIO",
     LOCALIZACIONES_SALON: "LOCALIZACIONES_SALON",
 
-    // Inventario y Productos
     INVENTARIO_PRODUCTO: "INVENTARIO_PRODUCTO",
+    /** @deprecated Usar COLLECTIONS.INVENTARIO_PRODUCTO */
     INVENTARIO_PRODUCTOS: "INVENTARIO_PRODUCTO",
     PRODUCTOS_VENTA: "PRODUCTOS_VENTA",
     MOVIMIENTO_INVENTARIO: "movimientoInventario",
     CONCILIACION_STOCK_WIX: "ConciliacionStockWix",
     PROVEEDORES_INVENTARIO: "ProveedoresInventario",
 
-    // Motor de Reservas y Concurrencia
     DUAL_CACHE: "DualSlotCache",
     DAYS_CACHE: "AvailabilityDaysCache",
     SLOTS_CACHE: "AvailabilitySlotsCache",
@@ -36,23 +38,21 @@ export const COLLECTIONS = Object.freeze({
     LOCKS: "MM_LOCKS",
     COMPENSATIONS: "PendingCompensations",
 
-    // Caja, TPV y Facturacion
     MOVIMIENTOS_CAJA: "movimientoCaja",
     CAJA_ACTUAL: "cajaActual",
     HISTORICO_CIERRES_Z: "HISTORICOCIERRESZ",
     CONTEOS_X: "RESUMENCONTEO_X",
     CONTADORES_FISCALES: "SecuenciaTickets",
 
-    // Personal y Control Horario
     REGISTRO_HORARIO: "REGISTROHORARIO",
 
-    // Logs, Auditoria y Sincronizacion
     AUDIT_LOG: "MMAUDIT_LOG",
     SYNC_LOG: "m365SyncLog",
     BOOKINGS_SERVICE_SYNC_QUEUE: "BookingsServiceSyncQueue",
     M365_GRAPH_SYNC_QUEUE: "M365GraphSyncQueue",
 
-    // Fiscalidad AEAT / Veri*Factu y Contabilidad
+    ALERTAS_OPERATIVAS: "AlertasOperativas",
+
     CONFIGURACION_FISCAL: "CONFIGURACIONFISCAL",
     EVENTOS_SISTEMA_FACTURACION: "EVENTOSSISTEMAFACTURACION",
     LIBRO_IVA_FACTURAS_EXPEDIDAS: "LIBROIVAFACTURASEXPEDIDAS",
@@ -137,7 +137,7 @@ export const SDK_CONFIG = Object.freeze({
         HMAC_MAX_CLOCK_SKEW_SECONDS: 60,
         CORS_ALLOWED_ORIGINS: ["https://www.marianmadrid.es", "https://marianmadrid.es"],
     }),
-    M365: Object.freeze({ ENABLED: false }),
+    M365: Object.freeze({ ENABLED: true }),
     ACCOUNTING: Object.freeze({ ENABLED: false }),
     DOCUMENTS: Object.freeze({
         DEFAULT_MANAGER_EMAIL: "gestion@marianmadrid.es",

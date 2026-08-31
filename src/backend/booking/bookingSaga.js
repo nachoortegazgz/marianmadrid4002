@@ -1,32 +1,13 @@
-/**
- * =============================================================================
- * MODULE: backend/booking/bookingSaga.js
- * VERSION: v20.0.0-dual-cache-invalidation-saga
- * RESPONSIBILITY: Transactional Saga Orchestrator for simple and dual bookings.
- * STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
- * HISTORIAL:
- * - v20.0.0-dual-cache-invalidation-saga: Invalidates availability caches for both
- *   serviceId (F1) and linkedServiceId (F2) upon successful saga completion.
- * - v19.6.15-confirmation-revision-compensation: Stores the revision returned by offline confirmation before later compensation can cancel a created booking.
- * - v19.6.14-canonical-slot-contract: Accepts the primary serviceId and resourceFilterId only from the normalized public payload.
- * - v19.6.7-writer-slot-native-id: Serializes Writer V2 resource and location identifiers with native _id fields.
- * - v19.6.3-prioritized-reliability-refactor: Removes duplicated catalog and slot paths, restores Codegem fixes, and hardens persistence.
- * - v19.6.2-serviceid-linkfases-contract: Uses serviceId and derives F2 only from Import2.linkFases.
- * - v19.6.0-writer-v2-contract-alignment: Serializes Writer V2 revisions for external effects and persists native add-ons only on F1 for correct revalidation after reschedule.
- * - v19.5.8-any-resource-resolution-priority: Uses the backend-resolved staff before inherited slot data when ANY was requested.
- * - v19.5.7-clean-resource-contract: Uses the simplified F1 staff-resolution contract without inert dual arguments.
- * - v19.5.3-lease-and-payment-hardening: Checks a lost lease before each external booking, checkout, confirmation, and CMS persistence effect.
- * - v19.5.1-certified-resource-preserved: Preserves the staff resource of a dual pair hydrated from cache before final revalidation.
- * - v19.5.0-dual-routing-enforced: A service configured as dual in Import2 cannot degrade to a simple F1 booking when F2 is absent.
- * - v19.4.8: Derives pairToken from canonical server-validated booking inputs; UI token is cache-only.
- * - v19.4.7: Sends native add-ons only with F1, whose Import2 catalog owns their group mapping.
- * - v19.4.6: Sends only Import2-mapped and SSOT-authorized native add-ons to Bookings V2.
- * - v19.3.0-exact-slot-recheck: Revalidates exact selected F1/F2 slots before booking.
- * - v19.2.0-saga-compensation-hardened: Compensates partial effects, persists inside the saga, and aborts on lost lock lease.
- * - v19.1.2-v3-v2-contract-aligned: Starts lock heartbeat only after lock acquisition.
- * - v19.1.1-v3-v2-contract-aligned: Uses canonical nested Slot V2 payloads.
- * =============================================================================
- */
+/*
+=============================================================================
+MODULE: backend/booking/bookingSaga.js
+VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-booking-saga-hardened)
+RESPONSIBILITY: Transactional Saga Orchestrator for simple and dual bookings.
+            Includes resilient heartbeat lock management, two-phase rollback,
+            and automatic pending compensation registration.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
 
 import wixData from "wix-data";
 
@@ -46,6 +27,8 @@ import {
     withTimeout,
     _isValidEmail,
     _maskEmail,
+    _sumAddons,
+    _extractRelationalId,
 } from "public/mmUtils";
 import {
     COLLECTIONS,
@@ -73,7 +56,6 @@ import {
     _initTransaction,
     _completeTransaction,
     _failTransaction,
-    _sumAddons,
 } from "backend/booking/bookingCore";
 
 import { hashSHA256 } from "backend/securityEngine";
@@ -94,6 +76,13 @@ const COMPENSATIONS_COLLECTION = COLLECTIONS.COMPENSATIONS;
 const API_TIMEOUT_MS = SDK_CONFIG?.TIMEOUTS?.API_MS || 15000;
 const HEARTBEAT_MS = CONCURRENCY?.HEARTBEAT_MS || 15000;
 const LOCK_TTL_MS = Number(CONCURRENCY?.MUTEX_TTL_MS) || 120000;
+
+function _stopHeartbeat(intervalRef) {
+    if (intervalRef) {
+        clearInterval(intervalRef);
+    }
+    return null;
+}
 
 function _buildNativeBookedAddOns(addonsNorm) {
     const selected = Array.isArray(addonsNorm) ? addonsNorm : [];
@@ -144,12 +133,6 @@ function _buildServerPairToken({ email, serviceId, linkedServiceId, resourceId, 
     });
 
     return `pt_${hashSHA256(canonical).substring(0, 40)}`;
-}
-
-function _normalizeSlotShape(slot) {
-    if (!slot || typeof slot !== "object") return null;
-    if (slot.slot && typeof slot.slot === "object") return { ...slot.slot, ...slot };
-    return slot;
 }
 
 async function _bestEffortUnlockAll(lockKeys, lockOwnerId, traceId) {
@@ -247,7 +230,6 @@ export async function executeBookingSaga(unsafePayload) {
         const { slotF1, slotF2, cliente, metaCita } = unsafePayload;
         if (!slotF1) throw createBookingError("INVALID_PAYLOAD", "La primera fase (slotF1) es obligatoria.");
 
-        // Resolve stable pair token + optional cached dual slot
         let effectiveSlotF2 = slotF2;
         let cachedDualPair = null;
 
@@ -273,7 +255,7 @@ export async function executeBookingSaga(unsafePayload) {
             (_looksLikeGuid(rawResourceId) ? rawResourceId : null) ||
             (_looksLikeGuid(slotResourceId) ? slotResourceId : null);
 
-        const serviceIdRaw = _safeTrim(slotF1.serviceId);
+        const serviceIdRaw = _extractRelationalId(slotF1.serviceId);
 
         const resolvedService = await resolveServiceId(serviceIdRaw);
         const serviceId = _safeTrim(resolvedService?.data);
@@ -296,7 +278,6 @@ export async function executeBookingSaga(unsafePayload) {
 
         const resourceIdForResolve = isAnyResourceRequested ? null : assignedResource;
 
-        // Load service SSOT from Import2 via reservas.web.js
         const svc = await getServiceForBookingInternal(serviceId, traceId);
         if (!svc || svc.status !== "SUCCESS" || !svc.data) {
             return { status: "ERROR", error: { code: "SERVICE_NOT_FOUND", message: "No se pudo cargar el servicio desde el catalogo." } };
@@ -354,7 +335,6 @@ export async function executeBookingSaga(unsafePayload) {
             }
         }
 
-        // Pricing: Import2 catalog is authoritative. Client supplies only requested addon IDs.
         const requestedAddonIds = Array.from(new Set(
             (Array.isArray(metaCita?.addons) ? metaCita.addons : [])
             .map((addon) => _safeTrim(addon?.addonId || addon))
@@ -381,11 +361,10 @@ export async function executeBookingSaga(unsafePayload) {
 
         const serviceName = serviceData?.metadata?.titulo || "Servicio";
         const basePrice = Number(serviceData?.metadata?.pricing?.base || 0);
-        const totalBilled = basePrice + addonsTotal;
+        const totalBilled = _roundMoney(basePrice + addonsTotal);
 
         const madridDateYMD = f1LocalStart.slice(0, 10);
 
-        // Resolve staff for F1 (and intersect with F2 if dual) (SSOT)
         const dualContext = isDualConfigured ? {
             start2: _normalizeLocalIsoStr(effectiveSlotF2?.localStartDate)
         } : null;
@@ -414,16 +393,14 @@ export async function executeBookingSaga(unsafePayload) {
             (assignedResource || resolvedId || null);
 
         if (isDualConfigured && certifiedPairResourceId && finalResourceId !== certifiedPairResourceId) {
-            return { status: "ERROR", error: { code: "CERTIFIED_RESOURCE_MISMATCH", message: "The selected dual pair is no longer bound to the certified professional." } };
+            return { status: "ERROR", error: { code: "CERTIFIED_RESOURCE_MISMATCH", message: "El par dual seleccionado ya no coincide con la profesional certificada." } };
         }
         if (!finalResourceId) {
             return { status: "ERROR", error: { code: "SLOT_UNAVAILABLE", message: "No se pudo asignar una profesional para este horario." } };
         }
 
-        const finalResourceName =
-            resourceValidation?.data?.resourceName || STAFF_DEFAULT_NAME;
+        const finalResourceName = resourceValidation?.data?.resourceName || STAFF_DEFAULT_NAME;
 
-        // Revalidate F1 at the exact user-selected time with the final assigned staff.
         const f1LocalEndReal = _normalizeLocalIsoStr(resourceValidation.data.slotF1?.localEndDate) || f1LocalEndSSOT;
         const exactF1 = await revalidateExactAvailabilitySlot({
             serviceId: String(serviceId),
@@ -491,7 +468,7 @@ export async function executeBookingSaga(unsafePayload) {
                 localEnd: f2LocalEnd,
                 tipo: "dual_fase2",
                 isDual: true,
-            }, ] : []),
+            }] : []),
         ];
 
         const stableToken = _buildServerPairToken({
@@ -547,7 +524,6 @@ export async function executeBookingSaga(unsafePayload) {
             }
         }
 
-        // If already persisted in CMS by pairToken, return idempotently
         const existingCita = await wixData
             .query(CITAS_COLLECTION)
             .eq("pairToken", stableToken)
@@ -610,18 +586,18 @@ export async function executeBookingSaga(unsafePayload) {
                             acquiredKeys.push(key);
                         }
 
-                        if (!heartbeatInterval) {
+                        if (!heartbeatInterval && lockKeys.length > 0) {
                             heartbeatInterval = setInterval(() => {
                                 Promise.all(lockKeys.map((key) => _renewLock(key, lockOwnerId, LOCK_TTL_MS)))
                                     .then((results) => {
                                         if (results.some((result) => !result?.ok)) {
                                             lockLeaseLost = true;
-                                            log.error("Lock lease lost during booking saga", { traceId, lockOwnerId });
+                                            log.error("Lock lease lost during booking saga renewal", { traceId, lockOwnerId });
                                         }
                                     })
                                     .catch((error) => {
                                         lockLeaseLost = true;
-                                        log.error("Lock heartbeat failed", { traceId, lockOwnerId, message: error?.message });
+                                        log.error("Lock heartbeat renewal exception", { traceId, lockOwnerId, message: error?.message });
                                     });
                             }, HEARTBEAT_MS);
                         }
@@ -629,16 +605,12 @@ export async function executeBookingSaga(unsafePayload) {
                         return { ok: true };
                     },
                     async () => {
-                        if (heartbeatInterval) {
-                            clearInterval(heartbeatInterval);
-                            heartbeatInterval = null;
-                        }
+                        heartbeatInterval = _stopHeartbeat(heartbeatInterval);
                         await _bestEffortUnlockAll(lockKeys, lockOwnerId, traceId);
                     }
             ),
         ];
 
-        // Contact details (Bookings V2)
         const isOnlinePaymentRequested = String(metaCita?.metodoPago || "").toUpperCase() === "ONLINE";
         const rawName = cliente.nombre || cliente.firstName || "Cliente";
         const nameParts = String(rawName).trim().split(/\s+/);
@@ -650,7 +622,6 @@ export async function executeBookingSaga(unsafePayload) {
             phone: _safePhone(cliente.telefono || cliente.phone),
         };
 
-        // Build pristine slots (async)
         for (const p of phases) {
             const phaseServiceId = p.key === "F2" ? linkedServiceId : serviceId;
             p.pristineSlot = _projectWriterSlotFromAvailability(p.validatedSlot, finalResourceId, phaseServiceId);
@@ -761,7 +732,6 @@ export async function executeBookingSaga(unsafePayload) {
             )
         );
 
-        // Payment decision
         const isOnlinePayment = isOnlinePaymentRequested;
         const needsCheckout = !!isOnlinePayment;
 
@@ -912,10 +882,7 @@ export async function executeBookingSaga(unsafePayload) {
 
         await _completeTransaction(stableToken, resultData);
 
-        if (heartbeatInterval) {
-            clearInterval(heartbeatInterval);
-            heartbeatInterval = null;
-        }
+        heartbeatInterval = _stopHeartbeat(heartbeatInterval);
 
         await _bestEffortUnlockAll(lockKeys, lockOwnerId, traceId);
 
@@ -930,17 +897,11 @@ export async function executeBookingSaga(unsafePayload) {
 
         return { status: "SUCCESS", data: resultData, error: null };
     } catch (error) {
-        if (heartbeatInterval) {
-            clearInterval(heartbeatInterval);
-            heartbeatInterval = null;
-        }
+        heartbeatInterval = _stopHeartbeat(heartbeatInterval);
         if (lockKeys.length > 0 && lockOwnerId) await _bestEffortUnlockAll(lockKeys, lockOwnerId, traceId);
         if (pairToken) await _failTransaction(pairToken, error?.message || String(error)).catch(() => {});
         return _handleError(error, "executeBookingSaga", traceId, log);
     } finally {
-        if (heartbeatInterval) {
-            clearInterval(heartbeatInterval);
-            heartbeatInterval = null;
-        }
+        heartbeatInterval = _stopHeartbeat(heartbeatInterval);
     }
 }

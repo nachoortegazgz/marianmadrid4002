@@ -1,18 +1,17 @@
-/**
- * =============================================================================
- * MODULE: backend/m365GraphSync.js
- * RESPONSIBILITY: Durable, minimal-data projection of finalized ledger records
- *                 to one private Microsoft 365 SharePoint list through Graph.
- * SECURITY: App-only credentials stay in Wix Secrets Manager. Queue payloads
- *           never contain customer profile, contact, service description, or
- *           raw upstream errors.
- * STANDARDS: G10 ASCII Strict.
- * =============================================================================
- */
+/*
+=============================================================================
+MODULE: backend/m365GraphSync.js
+VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-m365-sync-with-alerts)
+RESPONSIBILITY: Durable, minimal-data projection of finalized ledger records
+            to one private Microsoft 365 SharePoint list through Graph, with
+            operational queue monitoring and automated alerting to AlertasOperativas.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
 
 import wixData from "wix-data";
 import { getSecret } from "wix-secrets-backend";
-import { makeTraceId, withTimeout } from "public/mmUtils";
+import { makeTraceId, withTimeout, _normalizeIdPart } from "public/mmUtils";
 import { hashSHA256 } from "backend/securityEngine";
 import { _lockSlotKeyOrFail, _unlockSlotKey, logger } from "backend/booking/bookingCore";
 import { COLLECTIONS, SDK_CONFIG } from "backend/internalConfig";
@@ -21,7 +20,9 @@ import { SECRETS } from "backend/mmSecrets";
 const log = logger;
 const QUEUE_COL = COLLECTIONS.M365_GRAPH_SYNC_QUEUE;
 const SYNC_LOG_COL = COLLECTIONS.SYNC_LOG;
+const ALERTAS_COL = COLLECTIONS.ALERTAS_OPERATIVAS;
 const TIMEOUT_MS = Number(SDK_CONFIG?.TIMEOUTS?.API_MS) || 15000;
+const CMS_TIMEOUT_MS = Number(SDK_CONFIG?.TIMEOUTS?.CMS_MS) || 15000;
 const BATCH_SIZE = Math.max(1, Math.min(Number(SDK_CONFIG?.JOBS?.M365_GRAPH_SYNC_BATCH_SIZE) || 20, 50));
 const MAX_ATTEMPTS = Math.max(1, Math.min(Number(SDK_CONFIG?.JOBS?.M365_GRAPH_SYNC_MAX_ATTEMPTS) || 3, 5));
 const BACKOFF_MS = Math.max(60000, Number(SDK_CONFIG?.JOBS?.M365_GRAPH_SYNC_BACKOFF_MS) || 300000);
@@ -29,6 +30,14 @@ const LOCK_TTL_MS = 120000;
 const PENDING_STATES = ["PENDING", "RETRY", "BLOCKED"];
 const ALLOWED_EVENT_TYPES = new Set(["LEDGER_MOVEMENT", "Z_CLOSING"]);
 const GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0";
+
+const QUEUE_THRESHOLDS = Object.freeze({
+    MAX_PENDING: 50,
+    MAX_FAILED: 10,
+    MAX_BLOCKED: 5,
+    MAX_STALL_MINUTES: 15,
+    ALERT_THROTTLE_MS: 1800000,
+});
 
 function _isM365Enabled() {
     return SDK_CONFIG?.M365?.ENABLED === true;
@@ -228,6 +237,109 @@ async function _postListItem(config, token, payload) {
     return { externalRecordId: _cleanIdentifier(data?.id, 120), duplicate: false };
 }
 
+async function _emitOperationalAlertIfNeeded(alertType, level, message, details, traceId) {
+    try {
+        const throttleCutoff = new Date(Date.now() - QUEUE_THRESHOLDS.ALERT_THROTTLE_MS);
+        const existingAlert = await withTimeout(
+            wixData.query(ALERTAS_COL)
+                .eq("tipoAlerta", alertType)
+                .eq("estado", "ACTIVA")
+                .gt("fechaCreacion", throttleCutoff)
+                .limit(1)
+                .find({ suppressAuth: true }),
+            CMS_TIMEOUT_MS,
+            "checkRecentOperationalAlert"
+        ).catch(() => null);
+
+        if (existingAlert?.items?.length) return;
+
+        const alertDoc = {
+            _id: `ALERT_${_normalizeIdPart(alertType, 40)}_${Date.now()}`,
+            tipoAlerta: alertType,
+            nivel: level,
+            origen: "backend/m365GraphSync.js",
+            mensaje: _cleanText(message, 300),
+            detalles: details || {},
+            estado: "ACTIVA",
+            fechaCreacion: new Date(),
+            traceId: _cleanTraceId(traceId),
+        };
+
+        await withTimeout(
+            wixData.insert(ALERTAS_COL, alertDoc, { suppressAuth: true }),
+            CMS_TIMEOUT_MS,
+            "insertOperationalAlert"
+        );
+        log.warn(`Operational alert created: ${alertType}`, { traceId, level, message });
+    } catch (err) {
+        log.error("Failed to emit operational alert", { traceId, alertType, error: err?.message });
+    }
+}
+
+async function _checkQueueSaturationAndEmitAlerts(traceId) {
+    try {
+        const [pendingCount, failedCount, blockedCount, oldestPendingRes] = await Promise.all([
+            withTimeout(wixData.query(QUEUE_COL).in("status", ["PENDING", "RETRY"]).count({ suppressAuth: true }), CMS_TIMEOUT_MS, "countPendingQueue").catch(() => 0),
+            withTimeout(wixData.query(QUEUE_COL).eq("status", "FAILED").count({ suppressAuth: true }), CMS_TIMEOUT_MS, "countFailedQueue").catch(() => 0),
+            withTimeout(wixData.query(QUEUE_COL).eq("status", "BLOCKED").count({ suppressAuth: true }), CMS_TIMEOUT_MS, "countBlockedQueue").catch(() => 0),
+            withTimeout(wixData.query(QUEUE_COL).in("status", ["PENDING", "RETRY"]).ascending("createdAt").limit(1).find({ suppressAuth: true }), CMS_TIMEOUT_MS, "getOldestPending").catch(() => null),
+        ]);
+
+        const oldestItem = oldestPendingRes?.items?.[0] || null;
+        let oldestPendingMinutes = 0;
+        if (oldestItem?.createdAt) {
+            const createdTime = new Date(oldestItem.createdAt).getTime();
+            if (!Number.isNaN(createdTime) && createdTime > 0) {
+                oldestPendingMinutes = Math.floor((Date.now() - createdTime) / 60000);
+            }
+        }
+
+        const metrics = { pendingCount, failedCount, blockedCount, oldestPendingMinutes };
+
+        if (pendingCount > QUEUE_THRESHOLDS.MAX_PENDING) {
+            await _emitOperationalAlertIfNeeded(
+                "M365_QUEUE_SATURATION_PENDING",
+                "WARN",
+                `Cola de sincronizacion M365 saturada: ${pendingCount} elementos pendientes (umbral: ${QUEUE_THRESHOLDS.MAX_PENDING}).`,
+                metrics,
+                traceId
+            );
+        }
+
+        if (failedCount > QUEUE_THRESHOLDS.MAX_FAILED) {
+            await _emitOperationalAlertIfNeeded(
+                "M365_QUEUE_HIGH_FAILURES",
+                "ERROR",
+                `Alto numero de fallos terminales en M365: ${failedCount} elementos fallidos (umbral: ${QUEUE_THRESHOLDS.MAX_FAILED}).`,
+                metrics,
+                traceId
+            );
+        }
+
+        if (blockedCount > QUEUE_THRESHOLDS.MAX_BLOCKED) {
+            await _emitOperationalAlertIfNeeded(
+                "M365_QUEUE_BLOCKED_UNCONFIGURED",
+                "CRITICAL",
+                `Sincronizacion M365 bloqueada: ${blockedCount} elementos en estado BLOCKED por credenciales no configuradas.`,
+                metrics,
+                traceId
+            );
+        }
+
+        if (oldestPendingMinutes > QUEUE_THRESHOLDS.MAX_STALL_MINUTES) {
+            await _emitOperationalAlertIfNeeded(
+                "M365_QUEUE_STALLED",
+                "WARN",
+                `Cola de sincronizacion M365 estancada: el elemento mas antiguo lleva ${oldestPendingMinutes} min en cola (umbral: ${QUEUE_THRESHOLDS.MAX_STALL_MINUTES} min).`,
+                metrics,
+                traceId
+            );
+        }
+    } catch (err) {
+        log.error("Queue saturation check failed", { traceId, error: err?.message });
+    }
+}
+
 export async function enqueueM365LedgerRecord(movement, traceId) {
     if (!_isM365Enabled()) {
         return { status: "PAUSED", traceId: _cleanTraceId(traceId), queueId: "" };
@@ -329,5 +441,8 @@ export async function processM365GraphSyncQueue(options = {}) {
         else if (outcome.status === "BLOCKED") result.blocked++;
         else result.skipped++;
     }
+
+    await _checkQueueSaturationAndEmitAlerts(traceId);
+
     return { status: result.failed ? "PARTIAL" : "SUCCESS", data: result, error: null };
 }

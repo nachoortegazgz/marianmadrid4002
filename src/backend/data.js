@@ -1,15 +1,17 @@
 /*
 =============================================================================
 MODULE: backend/data.js
-VERSION: marianmadrid4001 (v20.1.2-canonical-unified-hooks)
+VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-unified-hooks-hardened)
 RESPONSIBILITY: CMS data hooks for canonical dates, immutable fiscal records,
-            and immutable labor records aligned with SERVICIOS_RESERVA,
-            MAPA_STAFF, and dropdown relational definitions.
+            immutable accounting entries, and immutable labor records aligned
+            with SERVICIOS_RESERVA, MAPA_STAFF, and dropdown relational definitions.
+            Enforces Wix CMS as the authoritative Single Source of Truth (SSOT).
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
+
 import wixData from "wix-data";
-import { getMadridLocalStringNoZ } from "public/mmUtils";
+import { getMadridLocalStringNoZ, _extractRelationalId } from "public/mmUtils";
 import {
     COLLECTIONS,
     SINGLETONS,
@@ -121,16 +123,8 @@ export function SERVICIOS_RESERVA_beforeUpdate(item, context) {
     return _validateServiceCatalog(item, context);
 }
 
-export function Import2_beforeInsert(item, context) {
-    return _validateServiceCatalog(item, context);
-}
-
-export function Import2_beforeUpdate(item, context) {
-    return _validateServiceCatalog(item, context);
-}
-
 async function _removeCollectionItemsByServiceId(collectionId, fields, serviceId) {
-    const cleanServiceId = String(serviceId || "").trim();
+    const cleanServiceId = _extractRelationalId(serviceId);
     if (!GUID_RE.test(cleanServiceId)) return;
 
     const matches = await Promise.allSettled(
@@ -179,14 +173,6 @@ export async function SERVICIOS_RESERVA_afterUpdate(item, context) {
     if (s2) await _invalidateServiceCaches(s2);
     await _enqueueBookingsServiceSyncSafely(item);
     return item;
-}
-
-export async function Import2_afterInsert(item, context) {
-    return SERVICIOS_RESERVA_afterInsert(item, context);
-}
-
-export async function Import2_afterUpdate(item, context) {
-    return SERVICIOS_RESERVA_afterUpdate(item, context);
 }
 
 function _validateMapaStaff(item, context) {
@@ -334,6 +320,30 @@ export function HISTORICOCIERRESZ_beforeUpdate(_item) {
 
 export function HISTORICOCIERRESZ_beforeRemove(_itemId) {
     throw new Error("FISCAL_VIOLATION: Direct removals from HISTORICOCIERRESZ are forbidden.");
+}
+
+export function RESUMENCONTEO_X_beforeUpdate(_item) {
+    throw new Error("FISCAL_VIOLATION: Direct updates to RESUMENCONTEO_X are forbidden.");
+}
+
+export function RESUMENCONTEO_X_beforeRemove(_itemId) {
+    throw new Error("FISCAL_VIOLATION: Direct removals from RESUMENCONTEO_X are forbidden.");
+}
+
+export function ASIENTOSCONTABLES_beforeUpdate(_item) {
+    throw new Error("ACCOUNTING_VIOLATION: Direct updates to ASIENTOSCONTABLES are forbidden.");
+}
+
+export function ASIENTOSCONTABLES_beforeRemove(_itemId) {
+    throw new Error("ACCOUNTING_VIOLATION: Direct removals from ASIENTOSCONTABLES are forbidden.");
+}
+
+export function LINEASASIENTOCONTABLE_beforeUpdate(_item) {
+    throw new Error("ACCOUNTING_VIOLATION: Direct updates to LINEASASIENTOCONTABLE are forbidden.");
+}
+
+export function LINEASASIENTOCONTABLE_beforeRemove(_itemId) {
+    throw new Error("ACCOUNTING_VIOLATION: Direct removals from LINEASASIENTOCONTABLE are forbidden.");
 }
 
 export function cajaActual_beforeInsert(item) {
