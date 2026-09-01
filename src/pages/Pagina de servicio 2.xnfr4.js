@@ -554,5 +554,3 @@ $w.onReady(async () => {
     );
   }
 });
-
-La imagen queda configurada como fallback cuando `metadata.imageUrl` está vacío.
