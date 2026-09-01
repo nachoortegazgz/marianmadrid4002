@@ -1,10 +1,10 @@
 /*
 =============================================================================
 MODULE: backend/inventario.web.js
-VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-inventory-mutex-locked)
+VERSION: marianmadrid4002 (v21.1.0-LTS-remediated)
 RESPONSIBILITY: Internal inventory management, salon professional consumption,
             supplier receipt, Stores/POS reconciliation queue, and dashboard.
-            Operates on stockDisponible and alertaStockBajo with distributed mutex locking.
+            Operates on stockDisponible and alertaStockBajo with optimistic CAS.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
@@ -15,22 +15,16 @@ import { currentMember } from "wix-members-backend";
 import {
     makeTraceId,
     _safeTrim,
-    _normalizeIdPart,
     withTimeout,
     _executeWithRetry,
+    _generateUUID,
 } from "public/mmUtils";
 import {
     COLLECTIONS,
     SDK_CONFIG,
     APP_IDS,
 } from "backend/internalConfig";
-import {
-    BookingError,
-    ERROR_CODES,
-    logger,
-    _lockSlotKeyOrFail,
-    _unlockSlotKey,
-} from "backend/booking/bookingCore";
+import { BookingError, ERROR_CODES, logger } from "backend/booking/bookingCore";
 import { requireCajero, isStaffCollaborator } from "backend/security";
 import { _toPublicError } from "backend/responseUtils";
 
@@ -39,7 +33,6 @@ const PRODUCTOS_COL = COLLECTIONS.INVENTARIO_PRODUCTO;
 const MOVIMIENTO_COL = COLLECTIONS.MOVIMIENTO_INVENTARIO;
 const CONCILIACION_COL = COLLECTIONS.CONCILIACION_STOCK_WIX;
 const CMS_TIMEOUT_MS = Number(SDK_CONFIG?.TIMEOUTS?.CMS_MS) || 15000;
-const INVENTORY_MUTEX_TTL_MS = 30000;
 
 function _toInvError(err, fallbackCode = "INVENTORY_ERROR", fallbackMessage = "Error de inventario") {
     return _toPublicError(err, fallbackCode, fallbackMessage);
@@ -113,105 +106,114 @@ export const registerInternalInventoryUse = webMethod(Permissions.SiteMember, as
             const quantity = Math.abs(Number(line.quantity) || 0);
             if (!sku || quantity <= 0) continue;
 
-            const lockKey = `inv_sku_${_normalizeIdPart(sku, 60)}`;
-            const lockOwnerId = `${traceId}:${_normalizeIdPart(sku, 60)}`;
-
-            const lockResult = await _lockSlotKeyOrFail(lockKey, lockOwnerId, INVENTORY_MUTEX_TTL_MS);
-            if (!lockResult?.ok) {
-                throw new BookingError(
-                    ERROR_CODES.TOKEN_BUSY,
-                    `El inventario para el SKU ${sku} esta bloqueado por otra operacion en curso. Reintente en unos segundos.`,
-                    { traceId, sku }
+            const updateResult = await _executeWithRetry(async () => {
+                const productRes = await withTimeout(
+                    wixData.query(PRODUCTOS_COL)
+                        .eq("sku", sku)
+                        .limit(1)
+                        .find({ suppressAuth: true, consistentRead: true }),
+                    CMS_TIMEOUT_MS,
+                    "queryProductBySkuConsistent"
                 );
-            }
+                const product = productRes?.items?.[0];
+                if (!product) return null;
 
-            try {
-                const updateResult = await _executeWithRetry(async () => {
-                    const productRes = await withTimeout(
-                        wixData.query(PRODUCTOS_COL)
-                            .eq("sku", sku)
-                            .limit(1)
-                            .find({ suppressAuth: true, consistentRead: true }),
-                        CMS_TIMEOUT_MS,
-                        "queryProductBySkuConsistent"
+                const observedVersionToken = String(
+                    product.fechaUltimoMovimientoInventario?.getTime?.() ??
+                    product._updatedDate?.getTime?.() ??
+                    ""
+                );
+
+                // Optimistic CAS check
+                const freshCheck = await withTimeout(
+                    wixData.get(PRODUCTOS_COL, product._id, { suppressAuth: true, consistentRead: true }).catch(() => null),
+                    CMS_TIMEOUT_MS,
+                    "checkProductVersionBeforeUse"
+                );
+
+                if (freshCheck) {
+                    const freshVersionToken = String(
+                        freshCheck.fechaUltimoMovimientoInventario?.getTime?.() ??
+                        freshCheck._updatedDate?.getTime?.() ??
+                        ""
                     );
-                    const product = productRes?.items?.[0];
-                    if (!product) return null;
+                    if (observedVersionToken && freshVersionToken !== observedVersionToken) {
+                        const conflictErr = new Error("INVENTORY_OPTIMISTIC_CONCURRENCY_CONFLICT");
+                        conflictErr.code = "CAS_CONFLICT";
+                        throw conflictErr;
+                    }
+                }
 
-                    const currentStock = Number(product.stockDisponible ?? product.stockExpected ?? 0);
-                    const newStock = Math.max(0, currentStock - quantity);
-                    const movementToken = `USE_${sku}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+                const currentStock = Number(freshCheck?.stockDisponible ?? freshCheck?.stockExpected ?? product.stockDisponible ?? product.stockExpected ?? 0);
+                const newStock = Math.max(0, currentStock - quantity);
+                const rndSuffix = _generateUUID().replace(/-/g, "").slice(0, 6);
+                const movementToken = `USE_${sku}_${Date.now()}_${rndSuffix}`;
 
-                    const mov = {
-                        _id: movementToken,
-                        movementToken,
-                        sku,
-                        nombreProducto: product.nombreProducto || product.productName || sku,
-                        quantity: -quantity,
-                        quantityDelta: -quantity,
-                        stockBefore: currentStock,
-                        stockAfter: newStock,
+                const mov = {
+                    _id: movementToken,
+                    movementToken,
+                    sku,
+                    nombreProducto: product.nombreProducto || product.productName || sku,
+                    quantity: -quantity,
+                    quantityDelta: -quantity,
+                    stockBefore: currentStock,
+                    stockAfter: newStock,
+                    stockDisponible: newStock,
+                    stockExpected: newStock,
+                    movementType: "CONSUMO_PROFESIONAL",
+                    reason: _safeTrim(line.note || line.reason) || "Consumo en salon",
+                    referenceId: _safeTrim(line.referenceId) || null,
+                    actorEmail: member?.loginEmail || "system",
+                    actorMemberId: member?._id || "system",
+                    requiresWixReconciliation: true,
+                    nativeCommercialMovement: false,
+                    productId: product.productId || product.wixProductId || null,
+                    variantId: product.variantId || product.wixVariantId || null,
+                    traceId,
+                    createdAt: now,
+                };
+
+                await withTimeout(wixData.insert(MOVIMIENTO_COL, mov, { suppressAuth: true }), CMS_TIMEOUT_MS, "insertMovInv");
+
+                const { _createdDate, _updatedDate, _owner, ...safeProduct } = (freshCheck || product);
+                await withTimeout(
+                    wixData.update(PRODUCTOS_COL, {
+                        ...safeProduct,
                         stockDisponible: newStock,
                         stockExpected: newStock,
-                        movementType: "CONSUMO_PROFESIONAL",
-                        reason: _safeTrim(line.note || line.reason) || "Consumo en salon",
-                        referenceId: _safeTrim(line.referenceId) || null,
-                        actorEmail: member?.loginEmail || "system",
-                        actorMemberId: member?._id || "system",
-                        requiresWixReconciliation: true,
-                        nativeCommercialMovement: false,
-                        productId: product.productId || product.wixProductId || null,
-                        variantId: product.variantId || product.wixVariantId || null,
-                        traceId,
-                        createdAt: now,
-                    };
-
-                    await withTimeout(wixData.insert(MOVIMIENTO_COL, mov, { suppressAuth: true }), CMS_TIMEOUT_MS, "insertMovInv");
-
-                    const { _createdDate, _updatedDate, _owner, ...safeProduct } = product;
-                    await withTimeout(
-                        wixData.update(PRODUCTOS_COL, {
-                            ...safeProduct,
-                            stockDisponible: newStock,
-                            stockExpected: newStock,
-                            fechaUltimoMovimientoInventario: now,
-                            idUltimoMovimientoInventario: movementToken,
-                            lastInventoryMovementId: movementToken,
-                            lastInventoryMovementAt: now,
-                            updatedAt: now,
-                        }, { suppressAuth: true }),
-                        CMS_TIMEOUT_MS,
-                        "updateStockExpected"
-                    );
-
-                    const queueItem = {
-                        _id: `RECON_${movementToken}`,
-                        movementToken,
-                        movementId: movementToken,
-                        sku,
-                        nombreProducto: product.nombreProducto || product.productName || sku,
-                        quantityDelta: -quantity,
-                        status: "PENDING",
-                        productId: product.productId || product.wixProductId || null,
-                        variantId: product.variantId || product.wixVariantId || null,
-                        reason: _safeTrim(line.note || line.reason) || "Consumo en salon",
-                        source: "ONLY_STAFF_USE",
-                        referenceId: _safeTrim(line.referenceId) || null,
-                        traceId,
-                        createdAt: now,
+                        fechaUltimoMovimientoInventario: now,
+                        idUltimoMovimientoInventario: movementToken,
+                        lastInventoryMovementId: movementToken,
+                        lastInventoryMovementAt: now,
                         updatedAt: now,
-                    };
+                    }, { suppressAuth: true }),
+                    CMS_TIMEOUT_MS,
+                    "updateStockExpected"
+                );
 
-                    await withTimeout(wixData.insert(CONCILIACION_COL, queueItem, { suppressAuth: true }), CMS_TIMEOUT_MS, "insertConciliacion");
-                    return { sku, quantityDelta: -quantity, newStockDisponible: newStock };
-                }, 3, 300);
+                const queueItem = {
+                    _id: `RECON_${movementToken}`,
+                    movementToken,
+                    movementId: movementToken,
+                    sku,
+                    nombreProducto: product.nombreProducto || product.productName || sku,
+                    quantityDelta: -quantity,
+                    status: "PENDING",
+                    productId: product.productId || product.wixProductId || null,
+                    variantId: product.variantId || product.wixVariantId || null,
+                    reason: _safeTrim(line.note || line.reason) || "Consumo en salon",
+                    source: "ONLY_STAFF_USE",
+                    referenceId: _safeTrim(line.referenceId) || null,
+                    traceId,
+                    createdAt: now,
+                    updatedAt: now,
+                };
 
-                if (updateResult) results.push(updateResult);
-            } finally {
-                await _unlockSlotKey(lockKey, lockOwnerId).catch((unlockErr) => {
-                    log.warn("Inventory use lock release failed", { traceId, sku, error: unlockErr?.message });
-                });
-            }
+                await withTimeout(wixData.insert(CONCILIACION_COL, queueItem, { suppressAuth: true }), CMS_TIMEOUT_MS, "insertConciliacion");
+                return { sku, quantityDelta: -quantity, newStockDisponible: newStock };
+            }, 5, 200);
+
+            if (updateResult) results.push(updateResult);
         }
 
         return { status: "SUCCESS", data: { results }, error: null };
@@ -236,105 +238,114 @@ export const registerInventoryReceipt = webMethod(Permissions.SiteMember, async 
             const quantity = Math.abs(Number(line.quantity) || 0);
             if (!sku || quantity <= 0) continue;
 
-            const lockKey = `inv_sku_${_normalizeIdPart(sku, 60)}`;
-            const lockOwnerId = `${traceId}:${_normalizeIdPart(sku, 60)}`;
-
-            const lockResult = await _lockSlotKeyOrFail(lockKey, lockOwnerId, INVENTORY_MUTEX_TTL_MS);
-            if (!lockResult?.ok) {
-                throw new BookingError(
-                    ERROR_CODES.TOKEN_BUSY,
-                    `El inventario para el SKU ${sku} esta bloqueado por otra operacion en curso. Reintente en unos segundos.`,
-                    { traceId, sku }
+            const updateResult = await _executeWithRetry(async () => {
+                const productRes = await withTimeout(
+                    wixData.query(PRODUCTOS_COL)
+                        .eq("sku", sku)
+                        .limit(1)
+                        .find({ suppressAuth: true, consistentRead: true }),
+                    CMS_TIMEOUT_MS,
+                    "queryProductBySkuRecvConsistent"
                 );
-            }
+                const product = productRes?.items?.[0];
+                if (!product) return null;
 
-            try {
-                const updateResult = await _executeWithRetry(async () => {
-                    const productRes = await withTimeout(
-                        wixData.query(PRODUCTOS_COL)
-                            .eq("sku", sku)
-                            .limit(1)
-                            .find({ suppressAuth: true, consistentRead: true }),
-                        CMS_TIMEOUT_MS,
-                        "queryProductBySkuRecvConsistent"
+                const observedVersionToken = String(
+                    product.fechaUltimoMovimientoInventario?.getTime?.() ??
+                    product._updatedDate?.getTime?.() ??
+                    ""
+                );
+
+                // Optimistic CAS check
+                const freshCheck = await withTimeout(
+                    wixData.get(PRODUCTOS_COL, product._id, { suppressAuth: true, consistentRead: true }).catch(() => null),
+                    CMS_TIMEOUT_MS,
+                    "checkProductVersionBeforeRecv"
+                );
+
+                if (freshCheck) {
+                    const freshVersionToken = String(
+                        freshCheck.fechaUltimoMovimientoInventario?.getTime?.() ??
+                        freshCheck._updatedDate?.getTime?.() ??
+                        ""
                     );
-                    const product = productRes?.items?.[0];
-                    if (!product) return null;
+                    if (observedVersionToken && freshVersionToken !== observedVersionToken) {
+                        const conflictErr = new Error("INVENTORY_OPTIMISTIC_CONCURRENCY_CONFLICT");
+                        conflictErr.code = "CAS_CONFLICT";
+                        throw conflictErr;
+                    }
+                }
 
-                    const currentStock = Number(product.stockDisponible ?? product.stockExpected ?? 0);
-                    const newStock = currentStock + quantity;
-                    const movementToken = `RECV_${sku}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+                const currentStock = Number(freshCheck?.stockDisponible ?? freshCheck?.stockExpected ?? product.stockDisponible ?? product.stockExpected ?? 0);
+                const newStock = currentStock + quantity;
+                const rndSuffix = _generateUUID().replace(/-/g, "").slice(0, 6);
+                const movementToken = `RECV_${sku}_${Date.now()}_${rndSuffix}`;
 
-                    const mov = {
-                        _id: movementToken,
-                        movementToken,
-                        sku,
-                        nombreProducto: product.nombreProducto || product.productName || sku,
-                        quantity,
-                        quantityDelta: quantity,
-                        stockBefore: currentStock,
-                        stockAfter: newStock,
+                const mov = {
+                    _id: movementToken,
+                    movementToken,
+                    sku,
+                    nombreProducto: product.nombreProducto || product.productName || sku,
+                    quantity,
+                    quantityDelta: quantity,
+                    stockBefore: currentStock,
+                    stockAfter: newStock,
+                    stockDisponible: newStock,
+                    stockExpected: newStock,
+                    movementType: "RECEPCION_PROVEEDOR",
+                    reason: _safeTrim(line.note || line.reason) || "Recepcion de mercancia",
+                    referenceId: _safeTrim(line.referenceId) || null,
+                    actorEmail: member?.loginEmail || "system",
+                    actorMemberId: member?._id || "system",
+                    requiresWixReconciliation: true,
+                    nativeCommercialMovement: false,
+                    productId: product.productId || product.wixProductId || null,
+                    variantId: product.variantId || product.wixVariantId || null,
+                    traceId,
+                    createdAt: now,
+                };
+
+                await withTimeout(wixData.insert(MOVIMIENTO_COL, mov, { suppressAuth: true }), CMS_TIMEOUT_MS, "insertMovInvRecv");
+
+                const { _createdDate, _updatedDate, _owner, ...safeProduct } = (freshCheck || product);
+                await withTimeout(
+                    wixData.update(PRODUCTOS_COL, {
+                        ...safeProduct,
                         stockDisponible: newStock,
                         stockExpected: newStock,
-                        movementType: "RECEPCION_PROVEEDOR",
-                        reason: _safeTrim(line.note || line.reason) || "Recepcion de mercancia",
-                        referenceId: _safeTrim(line.referenceId) || null,
-                        actorEmail: member?.loginEmail || "system",
-                        actorMemberId: member?._id || "system",
-                        requiresWixReconciliation: true,
-                        nativeCommercialMovement: false,
-                        productId: product.productId || product.wixProductId || null,
-                        variantId: product.variantId || product.wixVariantId || null,
-                        traceId,
-                        createdAt: now,
-                    };
-
-                    await withTimeout(wixData.insert(MOVIMIENTO_COL, mov, { suppressAuth: true }), CMS_TIMEOUT_MS, "insertMovInvRecv");
-
-                    const { _createdDate, _updatedDate, _owner, ...safeProduct } = product;
-                    await withTimeout(
-                        wixData.update(PRODUCTOS_COL, {
-                            ...safeProduct,
-                            stockDisponible: newStock,
-                            stockExpected: newStock,
-                            fechaUltimoMovimientoInventario: now,
-                            idUltimoMovimientoInventario: movementToken,
-                            lastInventoryMovementId: movementToken,
-                            lastInventoryMovementAt: now,
-                            updatedAt: now,
-                        }, { suppressAuth: true }),
-                        CMS_TIMEOUT_MS,
-                        "updateStockExpectedRecv"
-                    );
-
-                    const queueItem = {
-                        _id: `RECON_${movementToken}`,
-                        movementToken,
-                        movementId: movementToken,
-                        sku,
-                        nombreProducto: product.nombreProducto || product.productName || sku,
-                        quantityDelta: quantity,
-                        status: "PENDING",
-                        productId: product.productId || product.wixProductId || null,
-                        variantId: product.variantId || product.wixVariantId || null,
-                        reason: _safeTrim(line.note || line.reason) || "Recepcion de mercancia",
-                        source: "SUPPLIER_RECEIPT",
-                        referenceId: _safeTrim(line.referenceId) || null,
-                        traceId,
-                        createdAt: now,
+                        fechaUltimoMovimientoInventario: now,
+                        idUltimoMovimientoInventario: movementToken,
+                        lastInventoryMovementId: movementToken,
+                        lastInventoryMovementAt: now,
                         updatedAt: now,
-                    };
+                    }, { suppressAuth: true }),
+                    CMS_TIMEOUT_MS,
+                    "updateStockExpectedRecv"
+                );
 
-                    await withTimeout(wixData.insert(CONCILIACION_COL, queueItem, { suppressAuth: true }), CMS_TIMEOUT_MS, "insertConciliacionRecv");
-                    return { sku, quantityDelta: quantity, newStockDisponible: newStock };
-                }, 3, 300);
+                const queueItem = {
+                    _id: `RECON_${movementToken}`,
+                    movementToken,
+                    movementId: movementToken,
+                    sku,
+                    nombreProducto: product.nombreProducto || product.productName || sku,
+                    quantityDelta: quantity,
+                    status: "PENDING",
+                    productId: product.productId || product.wixProductId || null,
+                    variantId: product.variantId || product.wixVariantId || null,
+                    reason: _safeTrim(line.note || line.reason) || "Recepcion de mercancia",
+                    source: "SUPPLIER_RECEIPT",
+                    referenceId: _safeTrim(line.referenceId) || null,
+                    traceId,
+                    createdAt: now,
+                    updatedAt: now,
+                };
 
-                if (updateResult) results.push(updateResult);
-            } finally {
-                await _unlockSlotKey(lockKey, lockOwnerId).catch((unlockErr) => {
-                    log.warn("Inventory receipt lock release failed", { traceId, sku, error: unlockErr?.message });
-                });
-            }
+                await withTimeout(wixData.insert(CONCILIACION_COL, queueItem, { suppressAuth: true }), CMS_TIMEOUT_MS, "insertConciliacionRecv");
+                return { sku, quantityDelta: quantity, newStockDisponible: newStock };
+            }, 5, 200);
+
+            if (updateResult) results.push(updateResult);
         }
 
         return { status: "SUCCESS", data: { results }, error: null };
@@ -365,23 +376,29 @@ export const markInventoryReconciliationApplied = webMethod(Permissions.SiteMemb
         const cleanId = _safeTrim(reconciliationId);
         if (!cleanId) throw new BookingError(ERROR_CODES.INVALID_PAYLOAD, "reconciliationId required", { traceId });
 
-        const item = await withTimeout(wixData.get(CONCILIACION_COL, cleanId, { suppressAuth: true, consistentRead: true }), CMS_TIMEOUT_MS, "getReconciliationItem");
-        if (!item) throw new BookingError(ERROR_CODES.INVALID_PAYLOAD, "Reconciliation item not found", { traceId });
+        return await _executeWithRetry(async () => {
+            const item = await withTimeout(wixData.get(CONCILIACION_COL, cleanId, { suppressAuth: true, consistentRead: true }), CMS_TIMEOUT_MS, "getReconciliationItem");
+            if (!item) throw new BookingError(ERROR_CODES.INVALID_PAYLOAD, "Reconciliation item not found", { traceId });
 
-        const { _createdDate, _updatedDate, _owner, ...safeItem } = item;
-        const updated = await withTimeout(
-            wixData.update(CONCILIACION_COL, {
-                ...safeItem,
-                status: "APPLIED",
-                appliedAt: new Date(),
-                appliedByNote: _safeTrim(note) || "Reconciliation applied in Wix",
-                updatedAt: new Date(),
-            }, { suppressAuth: true }),
-            CMS_TIMEOUT_MS,
-            "updateReconciliationApplied"
-        );
+            if (String(item.status || "").toUpperCase() === "APPLIED") {
+                return { status: "SUCCESS", data: item, idempotent: true, error: null };
+            }
 
-        return { status: "SUCCESS", data: updated, error: null };
+            const { _createdDate, _updatedDate, _owner, ...safeItem } = item;
+            const updated = await withTimeout(
+                wixData.update(CONCILIACION_COL, {
+                    ...safeItem,
+                    status: "APPLIED",
+                    appliedAt: new Date(),
+                    appliedByNote: _safeTrim(note) || "Reconciliation applied in Wix",
+                    updatedAt: new Date(),
+                }, { suppressAuth: true }),
+                CMS_TIMEOUT_MS,
+                "updateReconciliationApplied"
+            );
+
+            return { status: "SUCCESS", data: updated, error: null };
+        }, 3, 200);
     } catch (error) {
         return { status: "ERROR", data: null, error: _toInvError(error, "INVENTORY_APPLY_FAIL") };
     }
