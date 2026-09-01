@@ -1,37 +1,28 @@
 /**
  * =============================================================================
  * MODULE: pages/servicio-2.js
- * VERSION: v21.0.2-canonical-service-widget
- * RESPONSIBILITY: Resolve a service from Import2 and connect the custom widget
- * to the canonical calendar and services routes.
+ * VERSION: v21.0.2-canonical-service-widget-image-fallback
+ * RESPONSIBILITY: Resolve Import2 service and connect the custom widget to
+ * canonical calendar and services routes.
  * STANDARDS: G10 ASCII Strict.
  * HISTORIAL:
- * - v21.0.2-fixed-ui-config-and-error-flow:
- *   Removes the unsafe UI.HANDSHAKE_TIMEOUT_MS dependency, adds local runtime
- *   configuration, protects async initialization, validates service data, and
- *   preserves the canonical serviceId and slugUrl contract.
+ * - v21.0.2-canonical-service-widget-image-fallback:
+ *   Removes unsafe UI dependency, adds local configuration, validates context,
+ *   preserves canonical serviceId and slugUrl, and sends a default image.
  * - v19.6.15-canonical-duration-context:
- *   Preserves canonical duracionTotal with nullish fallbacks only.
+ *   Preserves canonical duracionTotal.
  * - v19.6.14-canonical-widget-service-context:
- *   Emits serviceId only and removes the primaryServiceGuid alias.
+ *   Emits serviceId only.
  * - v19.6.10-widget-migration-context:
- *   Mirrors canonical serviceId to the active HTML widget context.
+ *   Sends canonical service context to the HTML widget.
  * - v19.6.7-ready-only-context:
- *   Relies on the bridge READY handshake before context delivery.
- * - v19.6.2-serviceid-linkfases-contract:
- *   Uses serviceId and derives F2 only from Import2.linkFases.
- * - v19.4.9:
- *   Normalizes the Service 2 presentation contract to Import2 camelCase fields.
+ *   Uses the widget READY handshake.
  * - v19.4.6:
- *   Carries only Import2-validated local add-on IDs to the calendar context.
+ *   Validates local add-on IDs before navigation.
  * - v19.4.4:
  *   Resolves Import2 by slugUrl first and serviceId second.
- * - v19.4.4:
- *   Validates BOOK and NAV targets before navigation.
- * - v19.4.4:
- *   Removes public service aliases and requires serviceId.
  * - v19.4.2:
- *   Uses the verified service image fallback.
+ *   Adds service image fallback.
  * =============================================================================
  */
 
@@ -61,9 +52,18 @@ const CONFIG = Object.freeze({
   FRONTEND_API_TIMEOUT_MS: 10000,
   FRONTEND_RETRY_ATTEMPTS: 2,
   FRONTEND_RETRY_BASE_BACKOFF_MS: 300,
-  DEFAULT_SERVICE_IMAGE_URL: "",
-  SALON_LOCATION_LABEL: "Marian Madrid",
-  DEFAULT_DURATION_MINUTES: 30
+  DEFAULT_DURATION_MINUTES: 30,
+  DEFAULT_LOCATION: "Marian Madrid",
+  DEFAULT_CURRENCY: "EUR",
+  DEFAULT_SERVICE_IMAGE_URL:
+    "data:image/svg+xml;charset=UTF-8," +
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 800'>" +
+    "<rect width='1200' height='800' fill='%23e9e2d9'/>" +
+    "<circle cx='930' cy='170' r='210' fill='%23d8bea0'/>" +
+    "<rect x='105' y='180' width='530' height='450' rx='30' fill='%23f7f3ee'/>" +
+    "<text x='160' y='420' fill='%23342b24' font-family='Georgia' font-size='68'>MARIAN</text>" +
+    "<text x='160' y='500' fill='%23342b24' font-family='Georgia' font-size='68'>MADRID</text>" +
+    "</svg>"
 });
 
 function _isGuid(value) {
@@ -291,6 +291,13 @@ function _buildContext(data, traceId) {
       ? data.metadata
       : {};
 
+  const serviceId = _isGuid(data.serviceId);
+  const slugUrl = _isSlug(data.slugUrl);
+
+  if (!serviceId || !slugUrl) {
+    throw new Error("Invalid canonical service context");
+  }
+
   const tituloServicio =
     _safeTrim(
       metadata.tituloServicio ||
@@ -321,30 +328,21 @@ function _buildContext(data, traceId) {
 
   const localizacion =
     _safeTrim(metadata.localizacion) ||
-    CONFIG.SALON_LOCATION_LABEL;
+    CONFIG.DEFAULT_LOCATION;
 
   const currency =
     _safeTrim(
       metadata.pricing?.currency ||
       MONEY?.DISPLAY_CURRENCY ||
-      "EUR"
-    ) || "EUR";
-
-  const canonicalServiceId = _isGuid(data.serviceId);
-  const canonicalSlugUrl = _isSlug(data.slugUrl);
-
-  if (!canonicalServiceId || !canonicalSlugUrl) {
-    throw new Error(
-      "Invalid canonical service context"
-    );
-  }
+      CONFIG.DEFAULT_CURRENCY
+    ) || CONFIG.DEFAULT_CURRENCY;
 
   return {
     ...data,
     traceId,
-    serviceId: canonicalServiceId,
-    slugUrl: canonicalSlugUrl,
-    slug: canonicalSlugUrl,
+    serviceId,
+    slugUrl,
+    slug: slugUrl,
     permitirCombinar: Boolean(data.permitirCombinar),
 
     metadata: {
@@ -432,12 +430,6 @@ $w.onReady(async function () {
         const type = _normType(message?.type);
         const payload = message?.payload || {};
 
-        const currentSlugUrl =
-          resolvedService?.slugUrl || "";
-
-        const currentServiceId =
-          resolvedService?.serviceId || "";
-
         if (
           type === _normType(MESSAGE_TYPES.BOOK)
         ) {
@@ -448,8 +440,8 @@ $w.onReady(async function () {
             );
 
           _goToCalendar(
-            currentSlugUrl,
-            currentServiceId,
+            resolvedService?.slugUrl,
+            resolvedService?.serviceId,
             addonIds
           );
 
@@ -478,8 +470,8 @@ $w.onReady(async function () {
             target.includes("CALENDAR")
           ) {
             _goToCalendar(
-              currentSlugUrl,
-              currentServiceId
+              resolvedService?.slugUrl,
+              resolvedService?.serviceId
             );
             return;
           }
@@ -501,3 +493,11 @@ $w.onReady(async function () {
     );
   }
 });
+```
+
+El widget HTML debe conservar:
+
+```js
+applyImage(metadata.imageUrl, title);
+
+La imagen predeterminada se utiliza cuando `metadata.imageUrl` está vacío o no existe.
