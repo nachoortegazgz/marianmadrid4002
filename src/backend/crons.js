@@ -1,10 +1,10 @@
 /*
 =============================================================================
 MODULE: backend/crons.js
-VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-crons-m365-enabled)
-RESPONSIBILITY: Scheduled background jobs: mutex lock purging, DualSlotCache cleanup,
-            DaysCache cleanup, automated Z-Closing, audit log retention,
-            system health monitoring, and M365 Graph synchronization queue processing.
+VERSION: marianmadrid4003 (v21.1.0-LTS-remediated-full-purges)
+RESPONSIBILITY: Scheduled background jobs: RAM cache eviction, mutex lock purging,
+            DualSlotCache cleanup, DaysCache cleanup, BookingTransactions purge,
+            Compensations retention, automated Z-Closing, and health monitoring.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
@@ -29,11 +29,10 @@ import {
     cancelBookingElevated,
     logger,
 } from "backend/booking/bookingCore";
-import { _cleanExpiredDualSlotsInternal } from "backend/reservas.web";
+import { _cleanExpiredDualSlotsInternal, purgeExpiredRamCaches } from "backend/reservas.web";
 import { _verifyIntegrityInternal, _registerZClosingInternal, processPendingFiscalRecoveries } from "backend/cajas.web";
 import { SECRETS } from "backend/mmSecrets";
 import { processBookingsServiceSyncQueue } from "backend/bookingsServiceSync";
-import { processM365GraphSyncQueue } from "backend/m365GraphSync";
 import { prepareScheduledManagerPackages } from "backend/fiscalDocuments.web";
 
 const log = logger;
@@ -46,6 +45,7 @@ const FISCAL_RECOVERY_BATCH_SIZE = SDK_CONFIG.JOBS.FISCAL_RECOVERY_BATCH_SIZE;
 const COMPENSATION_BATCH_SIZE = Math.max(1, Math.min(FISCAL_RECOVERY_BATCH_SIZE, 100));
 const MAX_COMPENSATION_RETRIES = Number(CONCURRENCY.MAX_COMPENSATION_RETRIES) || 3;
 const COMPENSATION_LOCK_TTL_MS = Number(CONCURRENCY.MUTEX_TTL_MS) || 120000;
+const COMPLETED_COMPENSATION_RETENTION_DAYS = 30;
 const queryExtendedBookingsElevated = elevate(extendedBookings.queryExtendedBookings);
 
 async function _removeByQuery(collectionName, queryBuilder, traceId, label) {
@@ -301,6 +301,49 @@ export async function cleanExpiredSlotsCache() {
     }
 }
 
+export async function cleanExpiredBookingTransactions() {
+    const traceId = makeTraceId("cron-clean-transactions");
+    try {
+        const now = new Date();
+        return await _removeByQuery(
+            COLLECTIONS.TRANSACTIONS,
+            wixData.query(COLLECTIONS.TRANSACTIONS).lt("expiresAt", now),
+            traceId,
+            "cron-cleanTransactions"
+        );
+    } catch (error) {
+        log.error("[CRON] Failed to clean expired booking transactions", { error: error?.message || String(error), traceId });
+        return { status: "ERROR", data: null, error: { code: "CRON_FAIL", message: error?.message || String(error) } };
+    }
+}
+
+export async function cleanOldCompletedCompensations() {
+    const traceId = makeTraceId("cron-clean-compensations");
+    try {
+        const cutoff = new Date(Date.now() - COMPLETED_COMPENSATION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+        return await _removeByQuery(
+            COLLECTIONS.COMPENSATIONS,
+            wixData.query(COLLECTIONS.COMPENSATIONS).eq("status", "COMPLETED").lt("updatedAt", cutoff),
+            traceId,
+            "cron-cleanOldCompletedCompensations"
+        );
+    } catch (error) {
+        log.error("[CRON] Failed to clean old completed compensations", { error: error?.message || String(error), traceId });
+        return { status: "ERROR", data: null, error: { code: "CRON_FAIL", message: error?.message || String(error) } };
+    }
+}
+
+export async function purgeRamCachesJob() {
+    const traceId = makeTraceId("cron-ram-purge");
+    try {
+        purgeExpiredRamCaches();
+        return { status: "SUCCESS", data: { purged: true }, error: null };
+    } catch (error) {
+        log.error("[CRON] RAM caches purge job failed", { traceId, error: error?.message || String(error) });
+        return { status: "ERROR", data: null, error: { code: "CRON_RAM_PURGE_FAIL", message: error?.message || String(error) } };
+    }
+}
+
 export async function processFiscalRecoveryQueue() {
     const traceId = makeTraceId("cron-fiscal-recovery");
     try {
@@ -318,20 +361,6 @@ export async function processBookingsServiceSyncJob() {
     } catch (_) {
         log.error("[CRON] Bookings service sync job failed", { traceId, errorCode: "BOOKINGS_SERVICE_SYNC_JOB_FAILED" });
         return { status: "ERROR", data: null, error: { code: "BOOKINGS_SERVICE_SYNC_JOB_FAILED", message: "Bookings service synchronization failed." } };
-    }
-}
-
-export async function processM365GraphSyncJob() {
-    const traceId = makeTraceId("cron-m365-graph-sync");
-    try {
-        return await processM365GraphSyncQueue({ traceId });
-    } catch (error) {
-        log.error("[CRON] M365 Graph sync job failed", { traceId, error: error?.message || String(error) });
-        return {
-            status: "ERROR",
-            data: null,
-            error: { code: "M365_GRAPH_SYNC_JOB_FAILED", message: error?.message || "M365 Graph synchronization failed." },
-        };
     }
 }
 
@@ -406,9 +435,6 @@ export async function cleanAuditLogs() {
     }
 }
 
-/**
- * EXTRA 009: Diagnostico global de salud del sistema, accesibilidad a CMS y clave fiscal.
- */
 export async function systemHealthCheck() {
     const traceId = makeTraceId("cron-health");
     let overallStatus = "OK";

@@ -1,52 +1,13 @@
-/**
- * =============================================================================
- * MODULE: backend/reservas.web.js
- * VERSION: v20.0.0-canonical-service-id-cache-alignment
- * RESPONSIBILITY: Availability engine, dual slots with gap, dual pairing with
- * same staff, workload-balanced staff allocation (minutes/day),
- * cache management, and service resolution.
- * STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
- * NOTES:
- * - No dependency on STAFF/findStaff from public code.
- * - Wix Bookings slot resources are authoritative for runtime staff availability.
- * - Staff display names resolved from backend MAPA_STAFF with bounded cache only after selection.
- * - Gap is MIN (>=) using Import2.tiempoExposicion (minutes).
- * HISTORIAL:
- * - v20.0.0-canonical-service-id-cache-alignment: Populates both serviceId and phaseOneServiceId
- *   in DualSlotCache to prevent alias query misses, and hardens slugOrId extraction.
- * - v20.0.0-optimized-batch-addons: Optimizes addon resolution with batch query (hasSome)
- *   to eliminate N+1 latency, and reuses shared utilities from mmUtils.js and responseUtils.js.
- * - v19.6.15-sdk-mutable-location-payload: Creates a fresh mutable location
- *   object for every Time Slots V2 request; SDK request mappers may normalize IDs.
- * - v19.6.14-editorial-reference-resolution: Resolves partial Wix Data references by option _id before validating native add-on bindings.
- * - v19.6.13-editorial-addon-options: Resolves selectable add-ons from ServiciosOpcionesAddon; Import2 no longer carries add-on objects.
- * - v19.6.12-dual-same-visit-hardening: Rejects dual pairs that cross the Madrid day boundary and requires staff resolution to preserve the exact certified F2 start.
- * - v19.6.10-native-addon-guid-contract: Restores strict support for native add-on GUID strings found in the live Import2 contract.
- * - v19.6.9-canonical-import2-contract: Removes legacy CSV aliases and requires camelCase Import2 fields plus native add-on objects.
- * - v19.6.8-current-bookings-sdk: Uses the current @wix/bookings SDK package for Time Slots V2 operations.
- * - v19.6.4-addon-id-contract: Preserves Import2 native addon GUID strings for Time Slots V2 rechecks.
- * - v19.6.3-prioritized-reliability-refactor: Removes duplicated catalog and slot paths, restores Codegem fixes, and hardens persistence.
- * - v19.6.2-serviceid-linkfases-contract: Uses serviceId and derives F2 only from Import2.linkFases.
- * - v19.6.1-same-day-dual-pairing: Limits all dual F2 searches to the requested Madrid day and removes the unused public next-slot wrapper.
- * - v19.5.9-native-addon-recheck: Uses List Availability Time Slots for native add-on rechecks and keeps Get Availability Time Slot free of unsupported customerChoices.
- * - v19.5.8-revalidation-diagnostics: Logs protected Time Slots V2 rejection context with traceId, location, local bounds, and no client PII.
- * - v19.5.7-clean-resource-contract: Removes inert F1 resolver parameters, bounds the staff display cache, and filters balancing reads by candidate resource IDs.
- * - v19.5.6-native-resource-decoupling: Removes Secrets-based resourceId resolution from Import2 mapping; native slots remain operational authority.
- * - v19.5.5-native-slot-resource-authority: Derives candidate resourceIds from revalidated Time Slots V2 data and always requests staff resource details.
- * - v19.5.4-time-slots-location-context: Uses the Time Slots V2 BUSINESS enum from the SSOT location context.
- * - v19.5.1-staff-presentation-audit: Returns backend-resolved staff display labels with authorized service resource IDs.
- * - v19.5.0-dual-route-and-balance: Enforces Import2 dual routing and tests ranked eligible staff before rejecting a dual pair.
- * - v19.4.9: Projects Import2 service presentation through camelCase metadata for Service 2 and Calendar 2.
- * - v19.4.7: Rejects malformed Madrid day values before constructing Time Slots V2 local bounds.
- * - v19.4.6: Resolves opt-in native add-ons from Import2 and uses their IDs in Time Slots V2 availability.
- * - v19.4.5: Removes the unused public staff catalog web method with an undefined internal dependency.
- * - v19.4.4: Import2 mapping supports canonical field IDs and verified CSV headings; removed the deprecated staff SDK dependency.
- * - v19.3.1: Replaced remaining Madrid timezone literals with SDK_CONFIG.TZ SSOT.
- * - v19.3.0: Added exact Time Slots V2 recheck and SSOT timezone.
- * - v19.2.2-v3-v2-sdk2-dual-gap-balance-hours: Corrected status list filtering for workload balance.
- * - v19.2.1-v3-v2-sdk2-dual-gap-balance-hours: Header standardized during V2 compliance review.
- * =============================================================================
- */
+/*
+=============================================================================
+MODULE: backend/reservas.web.js
+VERSION: marianmadrid4003 (v21.1.0-LTS-remediated-indexed-cache-pagination)
+RESPONSIBILITY: Availability engine, dual slots with gap, dual pairing with
+            same staff, workload-balanced staff allocation with full pagination,
+            indexed O(k) cache invalidation, and active RAM cache purge.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
 
 import { webMethod, Permissions } from "wix-web-module";
 import wixData from "wix-data";
@@ -67,6 +28,8 @@ import {
     _generateUUID,
     _normalizeSlotShape,
     withTimeout,
+    _roundMoney,
+    _extractRelationalId,
 } from "public/mmUtils";
 import {
     COLLECTIONS,
@@ -79,13 +42,13 @@ import {
 
 import { logger } from "backend/booking/bookingCore";
 import { _toPublicError } from "backend/responseUtils";
-import { findStaff } from "backend/staff";
+import { findStaff, getAllStaff } from "backend/staff";
 import { requireAdmin, rateLimiter } from "backend/security";
 
 const log = logger;
 
-const SERVICIOS_COL = COLLECTIONS.SERVICIOS_CITA;
-const EXTRAS_CATALOGO_COL = COLLECTIONS.EXTRAS_CATALOGO;
+const SERVICIOS_COL = COLLECTIONS.SERVICIOS_RESERVA;
+const EXTRAS_CATALOGO_COL = COLLECTIONS.ADDONS_CATALOGO;
 const DUAL_CACHE_COL = COLLECTIONS.DUAL_CACHE;
 const DAYS_CACHE_COL = COLLECTIONS.DAYS_CACHE;
 const CITAS_COL = COLLECTIONS.CITAS;
@@ -109,18 +72,38 @@ function _newTimeSlotsLocation() {
     };
 }
 
-// In-memory caches
-const availabilityCache = new Map(); // cacheKey -> { data, timestamp }
-const inflightRequests = new Map(); // cacheKey -> Promise
-const serviceCatalogRAM = new Map(); // key -> { data, timestamp }
-const serviceAddonOptionsRAM = new Map(); // optionId -> { data, timestamp }
+const availabilityCache = new Map();
+const availabilityKeysByService = new Map();
+const inflightRequests = new Map();
+const serviceCatalogRAM = new Map();
+const serviceAddonOptionsRAM = new Map();
 
-// -----------------------------------------------------------------------------
-// Staff display cache (backend only, no emails)
-// -----------------------------------------------------------------------------
 const STAFF_CACHE_TTL_MS = SDK_CONFIG.CACHE.STAFF_TTL_MS;
 const STAFF_DISPLAY_CACHE_MAX_ENTRIES = SDK_CONFIG.CACHE.MAX_ENTRIES;
-const staffDisplayCache = new Map(); // rid -> { name, ts }
+const staffDisplayCache = new Map();
+
+function _setAvailabilityCache(serviceId, cacheKey, data) {
+    const sId = String(serviceId || "");
+    _cacheSetBounded(availabilityCache, cacheKey, { data, timestamp: Date.now() }, CACHE_MAX_SIZE);
+    if (sId) {
+        if (!availabilityKeysByService.has(sId)) {
+            availabilityKeysByService.set(sId, new Set());
+        }
+        availabilityKeysByService.get(sId).add(cacheKey);
+    }
+}
+
+function _invalidateAvailabilityCacheByService(serviceId) {
+    const sId = String(serviceId || "");
+    if (!sId) return;
+    const keys = availabilityKeysByService.get(sId);
+    if (keys) {
+        for (const k of keys) {
+            availabilityCache.delete(k);
+        }
+        availabilityKeysByService.delete(sId);
+    }
+}
 
 async function _getStaffDisplayName(resourceId) {
     const resourceIdClean = _safeTrim(resourceId);
@@ -130,15 +113,12 @@ async function _getStaffDisplayName(resourceId) {
     if (cached && Date.now() - cached.ts < STAFF_CACHE_TTL_MS) return cached.name || "";
 
     const staff = await findStaff(resourceIdClean).catch(() => null);
-    const name = _safeTrim(staff?.displayName || staff?.name || "");
+    const name = _safeTrim(staff?.displayName || staff?.nombreVisible || staff?.name || "");
 
     _cacheSetBounded(staffDisplayCache, resourceIdClean, { name, ts: Date.now() }, STAFF_DISPLAY_CACHE_MAX_ENTRIES);
     return name;
 }
 
-// -----------------------------------------------------------------------------
-// Bounded cache eviction (LRU-ish)
-// -----------------------------------------------------------------------------
 function _cacheSetBounded(map, key, value, maxSize) {
     if (map.has(key)) map.delete(key);
     map.set(key, value);
@@ -147,9 +127,6 @@ function _cacheSetBounded(map, key, value, maxSize) {
     if (firstKey) map.delete(firstKey);
 }
 
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
 function _rateLimitOrThrow(surface, key, traceId) {
     const rl = rateLimiter({ surface, key });
     if (!rl.allowed) {
@@ -221,7 +198,7 @@ function _isValidMadridYmd(value) {
         date.getUTCDate() === day;
 }
 
-function _addDaysYMD(ymd, days) {
+function _addDaysYMDLocal(ymd, days) {
     if (!_isValidMadridYmd(ymd)) return "";
     const parts = String(ymd).split("-").map(Number);
     const dt = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2], 12, 0, 0));
@@ -234,13 +211,12 @@ function _filterDaysByLimit(daysArray) {
     const tz = SDK_CONFIG.TZ;
     const now = new Date();
     const todayStr = now.toLocaleDateString("sv-SE", { timeZone: tz });
-    const tomorrowStr = _addDaysYMD(todayStr, 1);
-    const maxDateStr = _addDaysYMD(todayStr, DIAS_LIMITE);
+    const tomorrowStr = _addDaysYMDLocal(todayStr, 1);
+    const maxDateStr = _addDaysYMDLocal(todayStr, DIAS_LIMITE);
     if (!tomorrowStr || !maxDateStr) return [];
     return daysArray.filter((date) => date >= tomorrowStr && date <= maxDateStr);
 }
 
-// Wix Bookings owns runtime resource availability. Import2 never authorizes a resourceId.
 function _normalizeResourceIds(resourceId, traceId) {
     if (!resourceId) return [];
 
@@ -279,24 +255,16 @@ function _minutesBetweenUtcDates(a, b) {
     return Math.round(ms / 60000);
 }
 
-// =============================================================================
-// SERVICE MAPPING (Import2 -> UX)
-// =============================================================================
-function _readImport2Field(service, fieldId) {
-    if (!service || typeof service !== "object") return undefined;
-    return service[fieldId];
-}
-
 function _readCatalogReferenceId(value) {
-    const candidate = value && typeof value === "object" ? (value._id || value.id) : value;
+    const candidate = value && typeof value === "object" ? (value.nombreCategoria || value._id || value.id) : value;
     return _safeTrim(candidate).toUpperCase();
 }
 
 function _formatEditorialAddonItem(option) {
     if (!option || typeof option !== "object") return null;
-    const addonId = _safeTrim(option.bookingsAddonId);
-    const groupId = _safeTrim(option.bookingsAddonGroupId);
-    if (!_looksLikeGuid(addonId) || !_looksLikeGuid(groupId) || option.activo !== true) return null;
+    const addonId = _safeTrim(option.idAddonBookings || option.bookingsAddonId || option.idAddon || option._id);
+    const groupId = _safeTrim(option.idGrupoAddonBookings || option.bookingsAddonGroupId || option.grupoInterno);
+    if (!_looksLikeGuid(addonId) || option.activo !== true) return null;
 
     const precioAddon = Number(option.precioAddon);
     const cantidadMaximaAddon = Number(option.cantidadMaximaAddon);
@@ -305,7 +273,7 @@ function _formatEditorialAddonItem(option) {
         nombre: _safeTrim(option.tituloAddon) || "Complemento",
         precio: Number.isFinite(precioAddon) && precioAddon >= 0 ? precioAddon : 0,
         bookingsAddonId: addonId,
-        bookingsAddonGroupId: groupId,
+        bookingsAddonGroupId: groupId || "GROUP_GENERAL",
         cantidadMaximaAddon: Number.isInteger(cantidadMaximaAddon) && cantidadMaximaAddon > 0 ? cantidadMaximaAddon : 1,
     };
 }
@@ -319,7 +287,7 @@ async function _resolveEditorialAddons(rawOptions, traceId) {
     const now = Date.now();
 
     for (const optionRef of refs) {
-        const optionId = _safeTrim(typeof optionRef === "object" ? optionRef?._id : optionRef);
+        const optionId = _extractRelationalId(optionRef);
         if (!optionId) continue;
 
         const cached = serviceAddonOptionsRAM.get(optionId);
@@ -329,7 +297,7 @@ async function _resolveEditorialAddons(rawOptions, traceId) {
         }
 
         const hasNativeBinding = optionRef && typeof optionRef === "object" &&
-            (_safeTrim(optionRef.bookingsAddonId) || _safeTrim(optionRef.bookingsAddonGroupId));
+            (_safeTrim(optionRef.idAddonBookings) || _safeTrim(optionRef.bookingsAddonId));
         if (hasNativeBinding) {
             const formatted = _formatEditorialAddonItem(optionRef);
             if (formatted) {
@@ -400,55 +368,50 @@ function _resolveAddonContext(service, requestedAddonIds) {
     };
 }
 
-async function _mapServiceImport2ToUX(service, traceId) {
-    const serviceId = _safeTrim(_readImport2Field(service, "serviceId"));
+async function _mapServiceToUX(service, traceId) {
+    const serviceId = _extractRelationalId(service.idServicio || service.serviceId);
     if (!_looksLikeGuid(serviceId)) {
-        throw new Error("Import2 invalid: serviceId missing or not a GUID");
+        throw new Error("Service catalog invalid: serviceId missing or not a GUID");
     }
 
-    const rawOculto = _readImport2Field(service, "oculto");
-    const estado = _readCatalogReferenceId(_readImport2Field(service, "estado"));
+    const rawOculto = service.oculto;
+    const estado = _readCatalogReferenceId(service.estado);
     if (estado && estado !== "ACTIVO") {
         throw new Error("Service is not available for public booking.");
     }
-    const categoria = _readCatalogReferenceId(_readImport2Field(service, "categoria"));
-    const monedaCatalogo = _readCatalogReferenceId(
-        _readImport2Field(service, "monedaCatalogo") || _readImport2Field(service, "moneda")
-    );
+    const categoria = _readCatalogReferenceId(service.nombreCategoria || service.categoria);
+    const monedaCatalogo = _readCatalogReferenceId(service.moneda || service.monedaCatalogo);
     const moneda = monedaCatalogo || SERVICE_CATALOG.CURRENCY;
     const isHiddenF2 = rawOculto === true;
-    const rawPermitir = _readImport2Field(service, "permitirCombinar");
+    const rawPermitir = service.permitirCombinar;
     const permitirCombinar = !isHiddenF2 && rawPermitir === true;
-    const linkFases = _safeTrim(_readImport2Field(service, "linkFases"));
+    const linkFases = _extractRelationalId(service.idServicioFaseDos || service.linkFases);
 
     if (permitirCombinar && !_looksLikeGuid(linkFases)) {
-        throw new Error("Import2 invalid: linkFases missing or not a GUID for dual service");
+        throw new Error("Service catalog invalid: linkFases missing or not a GUID for dual service");
     }
 
-    const tiempoFase1 = Number(_readImport2Field(service, "tiempoFase1")) || 0;
-    const tiempoExposicion = Number(_readImport2Field(service, "tiempoExposicion")) || 0;
-    const tiempoFase2 = Number(_readImport2Field(service, "tiempoFase2")) || 0;
-    const duracionTotal = Number(_readImport2Field(service, "duracionTotal")) || 0;
+    const tiempoFase1 = Number(service.tiempoFaseUno || service.tiempoFase1) || 0;
+    const tiempoExposicion = Number(service.tiempoExposicion) || 0;
+    const tiempoFase2 = Number(service.tiempoFaseDos || service.tiempoFase2) || 0;
+    const duracionTotal = Number(service.duracionTotal) || 0;
 
-    const tituloServicio = _safeTrim(_readImport2Field(service, "tituloServicio")) || "Servicio";
-    const precio = Number(_readImport2Field(service, "precio")) || 0;
-    const slugUrl = _safeTrim(_readImport2Field(service, "slugUrl")) || null;
-    const imageUrl = _safeTrim(_readImport2Field(service, "imagenPrincipal")) || "";
-    const localizacion = _safeTrim(_readImport2Field(service, "localizacion")) || null;
-    const resumenCorto = _safeTrim(_readImport2Field(service, "resumenCorto")) || null;
-    const descripcionLarga = _safeTrim(_readImport2Field(service, "descripcionLarga")) || null;
-    const recomendacionProductoRef = _safeTrim(_readImport2Field(service, "recomendacionProductoRef")) || null;
-    const recomendacionProductoRef2 = _safeTrim(_readImport2Field(service, "recomendacionProductoRef2")) || null;
+    const tituloServicio = _safeTrim(service.tituloServicio) || "Servicio";
+    const precio = Number(service.precio) || 0;
+    const slugUrl = _safeTrim(service.slugUrl) || null;
+    const imageUrl = _safeTrim(service.imagenPrincipal) || "";
+    const localizacion = _safeTrim(service.nombreLocalizacion || service.localizacion) || null;
+    const resumenCorto = _safeTrim(service.resumenCorto) || null;
+    const descripcionLarga = _safeTrim(service.descripcionLarga) || null;
 
     const estimatedTotal =
         duracionTotal ||
         (permitirCombinar ? tiempoFase1 + tiempoExposicion + tiempoFase2 : tiempoFase1) ||
         30;
 
-    // Import2 staff fields are optional UI hints only. Runtime availability comes from Wix Bookings slots.
     const staffDisponible = [];
     const staffOptions = [];
-    const rawAddonRefs = _readImport2Field(service, "addonsOptions") || _readImport2Field(service, "addonOptions") || [];
+    const rawAddonRefs = service.opcionesAddons || service.addonsOptions || service.addonOptions || [];
     const addons = await _resolveEditorialAddons(rawAddonRefs, traceId);
 
     return {
@@ -472,8 +435,6 @@ async function _mapServiceImport2ToUX(service, traceId) {
             localizacion,
             resumenCorto,
             descripcionLarga,
-            recomendacionProductoRef,
-            recomendacionProductoRef2,
             addons,
             addonsPrecio: addons.map((addon) => Number(addon?.precio || 0)),
             imageUrl,
@@ -483,9 +444,6 @@ async function _mapServiceImport2ToUX(service, traceId) {
     };
 }
 
-// =============================================================================
-// INTERNAL SERVICE RESOLVER
-// =============================================================================
 function _toPublicService(service) {
     if (!service || typeof service !== "object") return null;
     const { linkFases, ...publicService } = service;
@@ -496,7 +454,7 @@ async function _getServiceBySlugOrIdInternal(slugOrId, externalTraceId = null) {
     const traceId = externalTraceId || makeTraceId("service");
 
     const rawCandidate = typeof slugOrId === "object" && slugOrId !== null ?
-        (slugOrId.serviceId || slugOrId.slugUrl || slugOrId.slug || slugOrId.id || "") :
+        (slugOrId.idServicio || slugOrId.serviceId || slugOrId.slugUrl || slugOrId.slug || slugOrId.id || "") :
         slugOrId;
     const raw = _safeTrim(rawCandidate);
     const isGuid = _looksLikeGuid(raw);
@@ -516,11 +474,19 @@ async function _getServiceBySlugOrIdInternal(slugOrId, externalTraceId = null) {
 
         if (isGuid) {
             const result = await withTimeout(
-                wixData.query(SERVICIOS_COL).limit(1).eq("serviceId", clean).find({ suppressAuth: true }),
+                wixData.query(SERVICIOS_COL).limit(1).eq("idServicio", clean).find({ suppressAuth: true }),
                 WATCHDOG_TIMEOUT_MS,
-                "getServiceBySlugOrId:serviceId"
+                "getServiceBySlugOrId:idServicio"
             );
             service = result?.items?.[0] || null;
+            if (!service) {
+                const alt = await withTimeout(
+                    wixData.query(SERVICIOS_COL).limit(1).eq("serviceId", clean).find({ suppressAuth: true }),
+                    WATCHDOG_TIMEOUT_MS,
+                    "getServiceBySlugOrId:serviceId"
+                );
+                service = alt?.items?.[0] || null;
+            }
         } else {
             const result = await withTimeout(
                 wixData.query(SERVICIOS_COL).limit(1).eq("slugUrl", clean).find({ suppressAuth: true }),
@@ -531,11 +497,11 @@ async function _getServiceBySlugOrIdInternal(slugOrId, externalTraceId = null) {
         }
 
         if (!service) {
-            log.error("Service not found in Import2", { key: clean, traceId });
+            log.error("Service not found in SERVICIOS_RESERVA", { key: clean, traceId });
             return { status: "ERROR", data: null, error: { code: "SERVICE_NOT_FOUND", message: `Servicio "${slugOrId}" no encontrado.` } };
         }
 
-        const mapped = await _mapServiceImport2ToUX(service, traceId);
+        const mapped = await _mapServiceToUX(service, traceId);
 
         _cacheSetBounded(serviceCatalogRAM, clean, { data: mapped, timestamp: Date.now() }, CACHE_MAX_SIZE);
         if (mapped.serviceId) _cacheSetBounded(serviceCatalogRAM, mapped.serviceId, { data: mapped, timestamp: Date.now() }, CACHE_MAX_SIZE);
@@ -565,9 +531,6 @@ async function _resolveServiceIdInternal(serviceIdReq) {
     return null;
 }
 
-// =============================================================================
-// BOOKINGS V2: EXACT SLOT RECHECK
-// =============================================================================
 export async function revalidateExactAvailabilitySlot({ serviceId, localStartDate, localEndDate, resourceId, nativeAddonIds = [], traceId }) {
     const activeTraceId = traceId || makeTraceId("exact-slot");
     const resolvedServiceId = await _resolveServiceIdInternal(serviceId);
@@ -576,7 +539,7 @@ export async function revalidateExactAvailabilitySlot({ serviceId, localStartDat
     const requiredResourceId = _safeTrim(resourceId);
 
     if (!resolvedServiceId || !start || !end) {
-        return { status: "ERROR", data: null, error: { code: "INVALID_SLOT_RECHECK", message: "Selected slot data is invalid." } };
+        return { status: "ERROR", data: null, error: { code: "INVALID_SLOT_RECHECK", message: "Datos de slot invalidos para revalidacion." } };
     }
 
     try {
@@ -652,11 +615,11 @@ export async function revalidateExactAvailabilitySlot({ serviceId, localStartDat
         const availableResourceIds = _getResourceIdsFromSlot(normalized);
 
         if (!normalized || normalized.bookable !== true) {
-            return { status: "ERROR", data: null, error: { code: "SLOT_UNAVAILABLE", message: "Selected slot is no longer available." } };
+            return { status: "ERROR", data: null, error: { code: "SLOT_UNAVAILABLE", message: "El horario seleccionado ya no esta disponible." } };
         }
 
         if (requiredResourceId && !availableResourceIds.includes(requiredResourceId)) {
-            return { status: "ERROR", data: null, error: { code: "STAFF_UNAVAILABLE", message: "Selected staff is no longer available for this slot." } };
+            return { status: "ERROR", data: null, error: { code: "STAFF_UNAVAILABLE", message: "La profesional seleccionada no esta disponible para este horario." } };
         }
 
         return {
@@ -675,7 +638,6 @@ export async function revalidateExactAvailabilitySlot({ serviceId, localStartDat
     } catch (error) {
         const httpStatus = Number(error?.httpStatus || error?.statusCode || error?.response?.status || 0) || null;
         const wixErrorCode = _safeTrim(error?.code || error?.details?.applicationError?.code) || "UNKNOWN";
-        const requestedAddonCount = Array.isArray(nativeAddonIds) ? nativeAddonIds.length : 0;
 
         log.warn("Exact slot recheck failed", {
             traceId: activeTraceId,
@@ -685,10 +647,6 @@ export async function revalidateExactAvailabilitySlot({ serviceId, localStartDat
             serviceId: String(resolvedServiceId),
             localStartDate: start,
             localEndDate: end,
-            locationId: SDK_CONFIG.LOCATION_ID,
-            locationType: SDK_CONFIG.LOCATION_TYPES.TIME_SLOTS,
-            requestedAddonCount,
-            hasRequiredResource: Boolean(requiredResourceId),
         });
 
         return {
@@ -696,16 +654,13 @@ export async function revalidateExactAvailabilitySlot({ serviceId, localStartDat
             data: null,
             error: {
                 code: "SLOT_UNAVAILABLE",
-                message: "Selected slot could not be revalidated.",
+                message: "No se pudo revalidar el horario seleccionado.",
                 traceId: activeTraceId,
             },
         };
     }
 }
 
-// =============================================================================
-// BOOKINGS V2: LIST TIME SLOTS
-// =============================================================================
 async function _listTimeSlotsV2({ serviceId, fromLocalDate, toLocalDate, resourceIds, nativeAddonIds = [] }, options = {}) {
     const { skipCache = false, timeSlotsPerDay } = options;
 
@@ -778,7 +733,7 @@ async function _listTimeSlotsV2({ serviceId, fromLocalDate, toLocalDate, resourc
                 })
                 .filter((s) => s && s.localStartDate);
 
-            if (!skipCache) _cacheSetBounded(availabilityCache, cacheKey, { data: slots, timestamp: Date.now() }, CACHE_MAX_SIZE);
+            if (!skipCache) _setAvailabilityCache(resolvedServiceId, cacheKey, slots);
             return slots;
         } catch (e) {
             log.error("_listTimeSlotsV2 failed", { traceId, message: e?.message });
@@ -798,9 +753,6 @@ async function _listTimeSlotsV2({ serviceId, fromLocalDate, toLocalDate, resourc
     return await p;
 }
 
-// =============================================================================
-// BALANCING: least minutes booked today (CitasF2) for candidate staff
-// =============================================================================
 async function _getBookedMinutesByResourceForDay(dateYMD, resourceIds, _traceId) {
     const ymd = String(dateYMD || "").slice(0, 10);
     const ids = Array.isArray(resourceIds) ? resourceIds.map(String).filter(Boolean) : [];
@@ -813,9 +765,19 @@ async function _getBookedMinutesByResourceForDay(dateYMD, resourceIds, _traceId)
         .in("resourceId", ids)
         .limit(1000);
 
-    const res = await withTimeout(q.find({ suppressAuth: true }), WATCHDOG_TIMEOUT_MS, "balance:queryCitas").catch(() => null);
-    const items = Array.isArray(res?.items) ? res.items : [];
+    let allItems = [];
+    let res = await withTimeout(q.find({ suppressAuth: true }), WATCHDOG_TIMEOUT_MS, "balance:queryCitas_p1").catch(() => null);
+    allItems = allItems.concat(res?.items || []);
 
+    let page = 2;
+    const maxPages = 10;
+    while (res && res.hasNext() && page <= maxPages) {
+        res = await withTimeout(res.next(), WATCHDOG_TIMEOUT_MS, `balance:queryCitas_p${page}`).catch(() => null);
+        allItems = allItems.concat(res?.items || []);
+        page++;
+    }
+
+    const items = allItems;
     const minutes = {};
     ids.forEach((rid) => (minutes[rid] = 0));
 
@@ -842,12 +804,13 @@ async function _rankResourcesByLoad(candidateResourceIds, dateYMD, traceId) {
 
     const minutesMap = await _getBookedMinutesByResourceForDay(dateYMD, ids, traceId).catch(() => ({}));
 
+    const allStaffList = await getAllStaff().catch(() => []);
+    const staffMap = new Map(allStaffList.map((s) => [s.resourceId, s.displayName || s.nombreVisible]));
+
     const names = {};
-    await Promise.allSettled(
-        ids.map(async (rid) => {
-            names[rid] = (await _getStaffDisplayName(rid).catch(() => "")) || "";
-        })
-    );
+    for (const rid of ids) {
+        names[rid] = staffMap.get(rid) || (await _getStaffDisplayName(rid).catch(() => "")) || "";
+    }
 
     return ids.sort((a, b) => {
         const ma = Number(minutesMap[a] || 0);
@@ -859,14 +822,33 @@ async function _rankResourcesByLoad(candidateResourceIds, dateYMD, traceId) {
     });
 }
 
+export function purgeExpiredRamCaches() {
+    const now = Date.now();
+    for (const [k, v] of availabilityCache.entries()) {
+        if (now - v.timestamp > SLOTS_CACHE_TTL_MS) availabilityCache.delete(k);
+    }
+    for (const [sId, keySet] of availabilityKeysByService.entries()) {
+        for (const k of keySet) {
+            if (!availabilityCache.has(k)) keySet.delete(k);
+        }
+        if (keySet.size === 0) availabilityKeysByService.delete(sId);
+    }
+    for (const [k, v] of serviceCatalogRAM.entries()) {
+        if (now - v.timestamp > SERVICE_CACHE_TTL_MS) serviceCatalogRAM.delete(k);
+    }
+    for (const [k, v] of serviceAddonOptionsRAM.entries()) {
+        if (now - v.timestamp > SERVICE_CACHE_TTL_MS) serviceAddonOptionsRAM.delete(k);
+    }
+    for (const [k, v] of staffDisplayCache.entries()) {
+        if (now - v.ts > STAFF_CACHE_TTL_MS) staffDisplayCache.delete(k);
+    }
+}
+
 async function _pickLeastLoadedResource(candidateResourceIds, dateYMD, traceId) {
     const ranked = await _rankResourcesByLoad(candidateResourceIds, dateYMD, traceId);
     return ranked[0] || null;
 }
 
-// =============================================================================
-// NEXT SLOT: first slot >= fromLocalDateTime (optionally require staff)
-// =============================================================================
 async function _findNextSlotForServiceInternal(serviceId, fromLocalDateTime, requiredResourceId, traceId, sameDayOnly = false) {
     const resolvedServiceId = await _resolveServiceIdInternal(serviceId);
     if (!resolvedServiceId) return { status: "ERROR", data: null, error: { code: "SERVICE_NOT_FOUND", message: "Service ID not found" } };
@@ -881,7 +863,7 @@ async function _findNextSlotForServiceInternal(serviceId, fromLocalDateTime, req
 
     const maxDayOffset = sameDayOnly ? 0 : DIAS_LIMITE;
     for (let i = 0; i <= maxDayOffset; i++) {
-        const ymd = _addDaysYMD(startYMD, i);
+        const ymd = _addDaysYMDLocal(startYMD, i);
         const dayFrom = i === 0 ? fromLocal : `${ymd}T00:00:00`;
         const dayTo = `${ymd}T23:59:59`;
 
@@ -908,28 +890,25 @@ async function _findNextSlotForServiceInternal(serviceId, fromLocalDateTime, req
     return { status: "ERROR", data: null, error: { code: "SLOT_UNAVAILABLE", message: "No available slot found in search window." } };
 }
 
-// =============================================================================
-// DUAL SLOTS: pairing with gap + same staff + balance by booked minutes
-// =============================================================================
 export async function _cleanExpiredDualSlotsInternal({ limit = 100, traceId = null } = {}) {
     const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 100));
     const now = new Date();
     const result = await withTimeout(
-        wixData.query(DUAL_CACHE_COL).lt('expiresAt', now).limit(safeLimit).find({ suppressAuth: true }),
+        wixData.query(DUAL_CACHE_COL).lt("expiresAt", now).limit(safeLimit).find({ suppressAuth: true }),
         WATCHDOG_TIMEOUT_MS,
-        'cleanExpiredDualSlotsQuery'
+        "cleanExpiredDualSlotsQuery"
     );
     let removed = 0;
     for (const item of result?.items || []) {
         await withTimeout(
             wixData.remove(DUAL_CACHE_COL, item._id, { suppressAuth: true }),
             WATCHDOG_TIMEOUT_MS,
-            'cleanExpiredDualSlotsRemove'
+            "cleanExpiredDualSlotsRemove"
         );
         removed += 1;
     }
-    log.info('Expired dual cache entries cleaned', { removed, traceId });
-    return { status: 'SUCCESS', data: { removed }, error: null };
+    log.info("Expired dual cache entries cleaned", { removed, traceId });
+    return { status: "SUCCESS", data: { removed }, error: null };
 }
 
 export async function _getCertifiedDualSlotsInternal(serviceId, resourceId, dateYMD, requestedAddonIds = []) {
@@ -1065,7 +1044,6 @@ export async function _getCertifiedDualSlotsInternal(serviceId, resourceId, date
         });
     }
 
-    // Cache dual tokens (best-effort)
     if (pairs.length > 0) {
         const cachePromises = pairs.map((slotPair) => {
             const pairToken = slotPair.uiPairToken;
@@ -1096,9 +1074,6 @@ export async function _getCertifiedDualSlotsInternal(serviceId, resourceId, date
     return { status: "SUCCESS", data: pairs, error: null };
 }
 
-// =============================================================================
-// CACHE INVALIDATION (INTERNAL + ADMIN WEB METHOD)
-// =============================================================================
 export async function _invalidateCachesInternal(serviceId, dateYMD, resourceId, traceId = null) {
     const tId = traceId || makeTraceId("invalidate");
 
@@ -1106,10 +1081,7 @@ export async function _invalidateCachesInternal(serviceId, dateYMD, resourceId, 
     const ymd = _safeTrim(dateYMD);
     if (!resolvedServiceId || !_isValidMadridYmd(ymd)) return { ok: true, traceId: tId, skipped: true };
 
-    const prefix = `${String(resolvedServiceId)}__`;
-    for (const k of availabilityCache.keys()) {
-        if (String(k).startsWith(prefix)) availabilityCache.delete(k);
-    }
+    _invalidateAvailabilityCacheByService(resolvedServiceId);
 
     const yearMonth = String(ymd).slice(0, 7);
     const resourceIds = _normalizeResourceIds(resourceId, tId).sort().join(",");
@@ -1157,9 +1129,6 @@ export const invalidateCachesInternal = webMethod(Permissions.Admin, async (serv
     }
 });
 
-// =============================================================================
-// PUBLIC WEB METHODS
-// =============================================================================
 export async function getServiceForBookingInternal(serviceId, traceId = null) {
     return await _getServiceBySlugOrIdInternal(serviceId, traceId || makeTraceId("service-internal"));
 }
@@ -1221,8 +1190,8 @@ export const getAvailableDays = webMethod(Permissions.Anyone, async (serviceId, 
         const now = new Date();
         const todayStr = now.toLocaleDateString("sv-SE", { timeZone: tz });
 
-        const tomorrowStr = _addDaysYMD(todayStr, 1);
-        const maxDateStr = _addDaysYMD(todayStr, DIAS_LIMITE);
+        const tomorrowStr = _addDaysYMDLocal(todayStr, 1);
+        const maxDateStr = _addDaysYMDLocal(todayStr, DIAS_LIMITE);
 
         const firstDay = `${yearMonth}-01`;
         const lastDayNum = new Date(y, m, 0).getDate();
@@ -1283,7 +1252,6 @@ export const resolveStaffForSlot = webMethod(Permissions.Anyone, async (serviceI
         const dateYMD = String(start1).slice(0, 10);
         const isAnyStaff = !rId || ["all", "any"].includes(String(rId).trim().toLowerCase());
 
-        // 1. Get F1 candidates
         const slotsF1 = await _listTimeSlotsV2({
             serviceId: resolvedServiceId,
             fromLocalDate: `${dateYMD}T00:00:00`,
@@ -1300,8 +1268,7 @@ export const resolveStaffForSlot = webMethod(Permissions.Anyone, async (serviceI
         const slotF1 = _attachServiceId(slotF1Raw, resolvedServiceId, traceId, "resolveStaff:F1Norm");
         let candidateResourceIds = _getResourceIdsFromSlot(slotF1);
 
-        // 2. For a dual service, F2 is derived only from Import2.linkFases.
-        const linkedServiceId = serviceCfg.permitirCombinar ? _safeTrim(serviceCfg.linkFases) : "";
+        const linkedServiceId = serviceCfg.permitirCombinar ? _extractRelationalId(serviceCfg.linkFases) : "";
         let slotF2 = null;
         if (linkedServiceId) {
             if (!dualContext?.start2) {

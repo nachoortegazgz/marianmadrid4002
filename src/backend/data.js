@@ -1,11 +1,9 @@
 /*
 =============================================================================
 MODULE: backend/data.js
-VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-unified-hooks-hardened)
+VERSION: marianmadrid4002 (v21.1.0-LTS-remediated-cas-hooks)
 RESPONSIBILITY: CMS data hooks for canonical dates, immutable fiscal records,
-            immutable accounting entries, and immutable labor records aligned
-            with SERVICIOS_RESERVA, MAPA_STAFF, and dropdown relational definitions.
-            Enforces Wix CMS as the authoritative Single Source of Truth (SSOT).
+            immutable labor records, and optimistic versioning for CitasF2.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
@@ -239,6 +237,33 @@ export function CitasF2_beforeInsert(item, context) {
 
     item[CITA_FIELDS.STATUS] = String(item[CITA_FIELDS.STATUS] || ESTADO_CITA.CONFIRMED).toUpperCase();
     item[CITA_FIELDS.STATUS_PAGO] = String(item[CITA_FIELDS.STATUS_PAGO] || "UNPAID").toUpperCase();
+    item.version = Number(item.version || 1);
+    return item;
+}
+
+export function CitasF2_beforeUpdate(item, context) {
+    if (!item || typeof item !== "object" || context?.suppressHooks === true) return item;
+
+    const bookingId = String(item.bookingId || "").trim();
+    if (!bookingId) throw new Error("CITAS_VIOLATION: Missing bookingId.");
+    item.bookingId = bookingId;
+
+    const now = new Date();
+    _normalizeDateField(item, "startDate", null);
+    _normalizeDateField(item, "endDate", null);
+    _normalizeDateField(item, "fechaActualizacion", now);
+
+    if (!item.fechaYmdMadrid && item.startDate) {
+        item.fechaYmdMadrid = getMadridLocalStringNoZ(item.startDate).slice(0, 10);
+    }
+
+    if (item[CITA_FIELDS.STATUS]) {
+        item[CITA_FIELDS.STATUS] = String(item[CITA_FIELDS.STATUS]).toUpperCase();
+    }
+    if (item[CITA_FIELDS.STATUS_PAGO]) {
+        item[CITA_FIELDS.STATUS_PAGO] = String(item[CITA_FIELDS.STATUS_PAGO]).toUpperCase();
+    }
+    item.version = (Number(item.version) || 0) + 1;
     return item;
 }
 
@@ -320,30 +345,6 @@ export function HISTORICOCIERRESZ_beforeUpdate(_item) {
 
 export function HISTORICOCIERRESZ_beforeRemove(_itemId) {
     throw new Error("FISCAL_VIOLATION: Direct removals from HISTORICOCIERRESZ are forbidden.");
-}
-
-export function RESUMENCONTEO_X_beforeUpdate(_item) {
-    throw new Error("FISCAL_VIOLATION: Direct updates to RESUMENCONTEO_X are forbidden.");
-}
-
-export function RESUMENCONTEO_X_beforeRemove(_itemId) {
-    throw new Error("FISCAL_VIOLATION: Direct removals from RESUMENCONTEO_X are forbidden.");
-}
-
-export function ASIENTOSCONTABLES_beforeUpdate(_item) {
-    throw new Error("ACCOUNTING_VIOLATION: Direct updates to ASIENTOSCONTABLES are forbidden.");
-}
-
-export function ASIENTOSCONTABLES_beforeRemove(_itemId) {
-    throw new Error("ACCOUNTING_VIOLATION: Direct removals from ASIENTOSCONTABLES are forbidden.");
-}
-
-export function LINEASASIENTOCONTABLE_beforeUpdate(_item) {
-    throw new Error("ACCOUNTING_VIOLATION: Direct updates to LINEASASIENTOCONTABLE are forbidden.");
-}
-
-export function LINEASASIENTOCONTABLE_beforeRemove(_itemId) {
-    throw new Error("ACCOUNTING_VIOLATION: Direct removals from LINEASASIENTOCONTABLE are forbidden.");
 }
 
 export function cajaActual_beforeInsert(item) {
