@@ -1,7 +1,7 @@
 /*
 =============================================================================
 MODULE: backend/reservas.web.js
-VERSION: marianmadrid4003 (v21.1.0-LTS-remediated-indexed-cache-pagination)
+VERSION: marianmadrid4004 (v21.1.1-LTS-remediated-full-hardening)
 RESPONSIBILITY: Availability engine, dual slots with gap, dual pairing with
             same staff, workload-balanced staff allocation with full pagination,
             indexed O(k) cache invalidation, and active RAM cache purge.
@@ -28,7 +28,6 @@ import {
     _generateUUID,
     _normalizeSlotShape,
     withTimeout,
-    _roundMoney,
     _extractRelationalId,
 } from "public/mmUtils";
 import {
@@ -264,17 +263,19 @@ function _formatEditorialAddonItem(option) {
     if (!option || typeof option !== "object") return null;
     const addonId = _safeTrim(option.idAddonBookings || option.bookingsAddonId || option.idAddon || option._id);
     const groupId = _safeTrim(option.idGrupoAddonBookings || option.bookingsAddonGroupId || option.grupoInterno);
-    if (!_looksLikeGuid(addonId) || option.activo !== true) return null;
+    if (!_looksLikeGuid(addonId) || option.activo === false) return null;
 
-    const precioAddon = Number(option.precioAddon);
+    const precioAddon = Number(option.precioAddon ?? option.precio ?? 0);
+    const safePrecio = Number.isFinite(precioAddon) && precioAddon >= 0 ? precioAddon : 0;
     const cantidadMaximaAddon = Number(option.cantidadMaximaAddon);
     return {
         addonId,
-        nombre: _safeTrim(option.tituloAddon) || "Complemento",
-        precio: Number.isFinite(precioAddon) && precioAddon >= 0 ? precioAddon : 0,
+        nombre: _safeTrim(option.tituloAddon || option.nombre) || "Complemento",
+        precio: safePrecio,
         bookingsAddonId: addonId,
         bookingsAddonGroupId: groupId || "GROUP_GENERAL",
         cantidadMaximaAddon: Number.isInteger(cantidadMaximaAddon) && cantidadMaximaAddon > 0 ? cantidadMaximaAddon : 1,
+        activo: option.activo !== false,
     };
 }
 
@@ -292,7 +293,7 @@ async function _resolveEditorialAddons(rawOptions, traceId) {
 
         const cached = serviceAddonOptionsRAM.get(optionId);
         if (cached && now - cached.timestamp < SERVICE_CACHE_TTL_MS) {
-            if (cached.data) resolved.push(cached.data);
+            if (cached.data && cached.data.activo !== false) resolved.push(cached.data);
             continue;
         }
 
@@ -325,15 +326,21 @@ async function _resolveEditorialAddons(rawOptions, traceId) {
                 const item = itemsMap.get(optionId);
                 const formatted = item ? _formatEditorialAddonItem(item) : null;
                 _cacheSetBounded(serviceAddonOptionsRAM, optionId, { data: formatted, timestamp: now }, CACHE_MAX_SIZE);
-                if (formatted) resolved.push(formatted);
-                else log.warn("Editorial addon option is not natively bookable", { optionId, traceId });
+                if (formatted && formatted.activo !== false) resolved.push(formatted);
+                else log.warn("Editorial addon option is not active or natively bookable", { optionId, traceId });
             }
         } catch (err) {
             log.error("Batch query for addons failed", { traceId, message: err?.message });
         }
     }
 
-    return resolved;
+    const deduplicatedMap = new Map();
+    for (const addon of resolved) {
+        if (addon && addon.addonId && !deduplicatedMap.has(addon.addonId)) {
+            deduplicatedMap.set(addon.addonId, addon);
+        }
+    }
+    return Array.from(deduplicatedMap.values());
 }
 
 function _resolveAddonContext(service, requestedAddonIds) {
@@ -348,7 +355,12 @@ function _resolveAddonContext(service, requestedAddonIds) {
     }
 
     const catalog = Array.isArray(service?.metadata?.addons) ? service.metadata.addons : [];
-    const catalogById = new Map(catalog.map((addon) => [_safeTrim(addon?.addonId), addon]).filter(([addonId]) => Boolean(addonId)));
+    const catalogById = new Map(
+        catalog
+            .filter((addon) => addon && addon.activo !== false)
+            .map((addon) => [_safeTrim(addon?.addonId), addon])
+            .filter(([addonId]) => Boolean(addonId))
+    );
     const unknownAddonId = requestedIds.find((addonId) => !catalogById.has(addonId));
     if (unknownAddonId) throw new Error("ADDON_INVALID");
 
@@ -366,6 +378,11 @@ function _resolveAddonContext(service, requestedAddonIds) {
         selectedAddons,
         nativeAddonIds: Array.from(new Set(nativeAddonIds)).sort(),
     };
+}
+
+function _isValidSlug(value) {
+    const clean = _safeSlugOrId(value || "");
+    return Boolean(clean && !_looksLikeGuid(clean));
 }
 
 async function _mapServiceToUX(service, traceId) {
@@ -391,15 +408,15 @@ async function _mapServiceToUX(service, traceId) {
         throw new Error("Service catalog invalid: linkFases missing or not a GUID for dual service");
     }
 
-    const tiempoFase1 = Number(service.tiempoFaseUno || service.tiempoFase1) || 0;
-    const tiempoExposicion = Number(service.tiempoExposicion) || 0;
-    const tiempoFase2 = Number(service.tiempoFaseDos || service.tiempoFase2) || 0;
-    const duracionTotal = Number(service.duracionTotal) || 0;
+    const tiempoFase1 = Math.max(0, Number(service.tiempoFaseUno || service.tiempoFase1) || 0);
+    const tiempoExposicion = Math.max(0, Number(service.tiempoExposicion) || 0);
+    const tiempoFase2 = Math.max(0, Number(service.tiempoFaseDos || service.tiempoFase2) || 0);
+    const duracionTotal = Math.max(0, Number(service.duracionTotal) || 0);
 
     const tituloServicio = _safeTrim(service.tituloServicio) || "Servicio";
-    const precio = Number(service.precio) || 0;
+    const precio = Math.max(0, Number(service.precio) || 0);
     const slugUrl = _safeTrim(service.slugUrl) || null;
-    const imageUrl = _safeTrim(service.imagenPrincipal) || "";
+    const imageUrl = _safeTrim(service.imagenPrincipal || service.imageUrl) || "";
     const localizacion = _safeTrim(service.nombreLocalizacion || service.localizacion) || null;
     const resumenCorto = _safeTrim(service.resumenCorto) || null;
     const descripcionLarga = _safeTrim(service.descripcionLarga) || null;
@@ -409,9 +426,36 @@ async function _mapServiceToUX(service, traceId) {
         (permitirCombinar ? tiempoFase1 + tiempoExposicion + tiempoFase2 : tiempoFase1) ||
         30;
 
-    const staffDisponible = [];
-    const staffOptions = [];
-    const rawAddonRefs = service.opcionesAddons || service.addonsOptions || service.addonOptions || [];
+    let candidateResourceIds = [];
+    try {
+        const parsed = typeof service.personalDisponible === "string" ? JSON.parse(service.personalDisponible) : service.personalDisponible;
+        if (parsed && Array.isArray(parsed.staffIds)) {
+            candidateResourceIds = parsed.staffIds;
+        } else if (Array.isArray(service.personalDisponible)) {
+            candidateResourceIds = service.personalDisponible;
+        }
+    } catch (_) {}
+
+    const staffDisponible = Array.from(
+        new Set(
+            candidateResourceIds
+                .map((candidate) => (typeof candidate === "object" && candidate !== null ? candidate.resourceId || candidate.id || candidate._id : candidate))
+                .map((id) => _safeTrim(id))
+                .filter((id) => _looksLikeGuid(id))
+        )
+    );
+
+    const allStaff = await getAllStaff().catch(() => []);
+    const staffOptions = (staffDisponible.length > 0 ? allStaff.filter((s) => staffDisponible.includes(s.resourceId)) : allStaff)
+        .filter((s) => s.activo !== false)
+        .map((s) => ({
+            id: s.resourceId,
+            value: s.resourceId,
+            name: s.displayName || s.nombreVisible || STAFF_DEFAULT_NAME,
+            label: s.displayName || s.nombreVisible || STAFF_DEFAULT_NAME,
+        }));
+
+    const rawAddonRefs = service.opcionesAddons || service.addonsOptions || service.addonOptions || service.addons || [];
     const addons = await _resolveEditorialAddons(rawAddonRefs, traceId);
 
     return {
@@ -422,7 +466,7 @@ async function _mapServiceToUX(service, traceId) {
         tiempoFase1,
         tiempoExposicion,
         tiempoFase2,
-        duracionTotal,
+        duracionTotal: estimatedTotal,
         staffDisponible,
         staffOptions,
         metadata: {
@@ -435,8 +479,10 @@ async function _mapServiceToUX(service, traceId) {
             localizacion,
             resumenCorto,
             descripcionLarga,
+            recomendacionProductoRef: _safeTrim(service.recomendacionProductoRef) || null,
+            recomendacionProductoRef2: _safeTrim(service.recomendacionProductoRef2) || null,
             addons,
-            addonsPrecio: addons.map((addon) => Number(addon?.precio || 0)),
+            addonsPrecio: addons.map((addon) => Math.max(0, Number(addon?.precio || 0))),
             imageUrl,
             pricing: { base: precio, currency: moneda },
             timing: { estimatedTotal, totalDuration: estimatedTotal },
@@ -498,7 +544,7 @@ async function _getServiceBySlugOrIdInternal(slugOrId, externalTraceId = null) {
 
         if (!service) {
             log.error("Service not found in SERVICIOS_RESERVA", { key: clean, traceId });
-            return { status: "ERROR", data: null, error: { code: "SERVICE_NOT_FOUND", message: `Servicio "${slugOrId}" no encontrado.` } };
+            return { status: "ERROR", data: null, error: { code: "SERVICE_NOT_FOUND", message: `Servicio no encontrado.` } };
         }
 
         const mapped = await _mapServiceToUX(service, traceId);
@@ -510,7 +556,7 @@ async function _getServiceBySlugOrIdInternal(slugOrId, externalTraceId = null) {
         return { status: "SUCCESS", data: mapped, error: null };
     } catch (e) {
         log.error("Error in getServiceBySlugOrId", { error: e?.message, traceId });
-        return { status: "ERROR", data: null, error: { code: "DATABASE_ERROR", message: e?.message || "Error al consultar la base de datos." } };
+        return { status: "ERROR", data: null, error: { code: "DATABASE_ERROR", message: "No se pudo consultar el servicio." } };
     }
 }
 
@@ -770,7 +816,7 @@ async function _getBookedMinutesByResourceForDay(dateYMD, resourceIds, _traceId)
     allItems = allItems.concat(res?.items || []);
 
     let page = 2;
-    const maxPages = 10;
+    const maxPages = 100;
     while (res && res.hasNext() && page <= maxPages) {
         res = await withTimeout(res.next(), WATCHDOG_TIMEOUT_MS, `balance:queryCitas_p${page}`).catch(() => null);
         allItems = allItems.concat(res?.items || []);
@@ -798,7 +844,9 @@ async function _getBookedMinutesByResourceForDay(dateYMD, resourceIds, _traceId)
 
 async function _rankResourcesByLoad(candidateResourceIds, dateYMD, traceId) {
     const ids = Array.from(new Set(
-        Array.isArray(candidateResourceIds) ? candidateResourceIds.map(String).filter(Boolean) : []
+        (Array.isArray(candidateResourceIds) ? candidateResourceIds : [])
+            .map((id) => _safeTrim(id))
+            .filter((id) => _looksLikeGuid(id))
     ));
     if (ids.length <= 1) return ids;
 
@@ -893,22 +941,40 @@ async function _findNextSlotForServiceInternal(serviceId, fromLocalDateTime, req
 export async function _cleanExpiredDualSlotsInternal({ limit = 100, traceId = null } = {}) {
     const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 100));
     const now = new Date();
-    const result = await withTimeout(
+    let removed = 0;
+    let pageCount = 0;
+    const maxPages = 100;
+
+    let res = await withTimeout(
         wixData.query(DUAL_CACHE_COL).lt("expiresAt", now).limit(safeLimit).find({ suppressAuth: true }),
         WATCHDOG_TIMEOUT_MS,
-        "cleanExpiredDualSlotsQuery"
+        "cleanExpiredDualSlotsQuery_p1"
     );
-    let removed = 0;
-    for (const item of result?.items || []) {
-        await withTimeout(
-            wixData.remove(DUAL_CACHE_COL, item._id, { suppressAuth: true }),
-            WATCHDOG_TIMEOUT_MS,
-            "cleanExpiredDualSlotsRemove"
-        );
-        removed += 1;
+
+    while (res && res.items && res.items.length > 0 && pageCount < maxPages) {
+        pageCount++;
+        for (const item of res.items) {
+            await withTimeout(
+                wixData.remove(DUAL_CACHE_COL, item._id, { suppressAuth: true }),
+                WATCHDOG_TIMEOUT_MS,
+                "cleanExpiredDualSlotsRemove"
+            ).catch(() => null);
+            removed += 1;
+        }
+
+        if (res.hasNext()) {
+            res = await withTimeout(
+                res.next(),
+                WATCHDOG_TIMEOUT_MS,
+                `cleanExpiredDualSlotsQuery_p${pageCount + 1}`
+            ).catch(() => null);
+        } else {
+            break;
+        }
     }
-    log.info("Expired dual cache entries cleaned", { removed, traceId });
-    return { status: "SUCCESS", data: { removed }, error: null };
+
+    log.info("Expired dual cache entries cleaned", { removed, pageCount, traceId });
+    return { status: "SUCCESS", data: { removed, pages: pageCount }, error: null };
 }
 
 export async function _getCertifiedDualSlotsInternal(serviceId, resourceId, dateYMD, requestedAddonIds = []) {
@@ -938,7 +1004,11 @@ export async function _getCertifiedDualSlotsInternal(serviceId, resourceId, date
     const rankedCandidateCache = new Map();
 
     async function _rankCandidates(candidateResourceIds) {
-        const normalized = Array.from(new Set((candidateResourceIds || []).map(String).filter(Boolean)));
+        const normalized = Array.from(new Set(
+            (candidateResourceIds || [])
+                .map((id) => _safeTrim(id))
+                .filter((id) => _looksLikeGuid(id))
+        ));
         const key = normalized.slice().sort().join("|");
         if (!key) return [];
         if (rankedCandidateCache.has(key)) return rankedCandidateCache.get(key);
@@ -1083,6 +1153,12 @@ export async function _invalidateCachesInternal(serviceId, dateYMD, resourceId, 
 
     _invalidateAvailabilityCacheByService(resolvedServiceId);
 
+    const svcRes = await _getServiceBySlugOrIdInternal(resolvedServiceId, tId).catch(() => null);
+    const linkedServiceId = svcRes?.data?.permitirCombinar ? _extractRelationalId(svcRes.data.linkFases) : null;
+    if (linkedServiceId) {
+        _invalidateAvailabilityCacheByService(linkedServiceId);
+    }
+
     const yearMonth = String(ymd).slice(0, 7);
     const resourceIds = _normalizeResourceIds(resourceId, tId).sort().join(",");
     const daysCacheId = `${DAYS_CACHE_VERSION}__${String(resolvedServiceId)}__${_hashKey(resourceIds)}__${String(yearMonth)}`;
@@ -1100,15 +1176,47 @@ export async function _invalidateCachesInternal(serviceId, dateYMD, resourceId, 
         }
     }
 
+    if (linkedServiceId) {
+        const linkedDaysCacheId = `${DAYS_CACHE_VERSION}__${String(linkedServiceId)}__${_hashKey(resourceIds)}__${String(yearMonth)}`;
+        try {
+            await withTimeout(
+                wixData.remove(DAYS_CACHE_COL, linkedDaysCacheId, { suppressAuth: true }),
+                WATCHDOG_TIMEOUT_MS,
+                "invalidateLinkedDaysCache"
+            );
+        } catch (e) {
+            const msg = String(e?.message || "");
+            if (!msg.includes("WDE0073") && !msg.includes("does not exist") && !msg.includes("WD_ITEM_DOES_NOT_EXIST")) {
+                throw e;
+            }
+        }
+    }
+
     try {
-        const res = await withTimeout(
-            wixData.query(DUAL_CACHE_COL).eq("phaseOneServiceId", String(resolvedServiceId)).eq("dateYMD", String(ymd)).limit(100).find({ suppressAuth: true }),
+        let res = await withTimeout(
+            wixData.query(DUAL_CACHE_COL)
+                .eq("dateYMD", String(ymd))
+                .and(
+                    wixData.query(DUAL_CACHE_COL)
+                        .eq("phaseOneServiceId", String(resolvedServiceId))
+                        .or(wixData.query(DUAL_CACHE_COL).eq("serviceId", String(resolvedServiceId)))
+                )
+                .limit(100)
+                .find({ suppressAuth: true }),
             WATCHDOG_TIMEOUT_MS,
             "invalidateDualCacheQuery"
         );
 
+        let itemsToRemove = res?.items || [];
+        let p = 2;
+        while (res && res.hasNext() && p <= 10) {
+            res = await withTimeout(res.next(), WATCHDOG_TIMEOUT_MS, `invalidateDualCacheQuery_p${p}`);
+            itemsToRemove = itemsToRemove.concat(res?.items || []);
+            p++;
+        }
+
         await Promise.allSettled(
-            (res?.items || []).map((it) => wixData.remove(DUAL_CACHE_COL, it._id, { suppressAuth: true }).catch(() => null))
+            itemsToRemove.map((it) => wixData.remove(DUAL_CACHE_COL, it._id, { suppressAuth: true }).catch(() => null))
         );
     } catch (e) {
         log.warn("_invalidateCachesInternal: dual cache cleanup failed (best-effort)", { traceId: tId, message: e?.message });
@@ -1170,17 +1278,17 @@ export const getAvailableDays = webMethod(Permissions.Anyone, async (serviceId, 
         );
 
         const resolved = await _resolveServiceIdInternal(serviceId);
-        if (!resolved) return { status: "ERROR", data: null, error: { code: "SERVICE_NOT_FOUND", message: "Service ID not found" } };
+        if (!resolved) return { status: "ERROR", data: null, error: { code: "SERVICE_NOT_FOUND", message: "Servicio no encontrado." } };
 
         const svcRes = await _getServiceBySlugOrIdInternal(resolved, traceId);
         const service = svcRes?.data;
-        if (!service) return { status: "ERROR", data: null, error: { code: "SERVICE_CONFIG_MISSING", message: "Service configuration missing" } };
+        if (!service) return { status: "ERROR", data: null, error: { code: "SERVICE_CONFIG_MISSING", message: "Configuracion de servicio no disponible." } };
         const addonContext = _resolveAddonContext(service, addonIds);
         const resourceIds = _normalizeResourceIds(resourceId, traceId);
 
         const y = Number(year);
         const m = Number(month);
-        if (!Number.isFinite(y) || !Number.isFinite(m) || m < 1 || m > 12) {
+        if (!Number.isInteger(y) || !Number.isInteger(m) || m < 1 || m > 12) {
             return { status: "ERROR", data: null, error: { code: "INVALID_PARAMS", message: "Invalid year/month" } };
         }
 
@@ -1194,7 +1302,7 @@ export const getAvailableDays = webMethod(Permissions.Anyone, async (serviceId, 
         const maxDateStr = _addDaysYMDLocal(todayStr, DIAS_LIMITE);
 
         const firstDay = `${yearMonth}-01`;
-        const lastDayNum = new Date(y, m, 0).getDate();
+        const lastDayNum = new Date(Date.UTC(y, m, 0)).getUTCDate();
         const lastDay = `${yearMonth}-${String(lastDayNum).padStart(2, "0")}`;
 
         const fromLocal = tomorrowStr > firstDay ? tomorrowStr : firstDay;
@@ -1242,11 +1350,11 @@ export const resolveStaffForSlot = webMethod(Permissions.Anyone, async (serviceI
         _rateLimitOrThrow("reservas.resolveStaffForSlot", `${_safeTrim(serviceId)}|${_safeTrim(start1)}`, traceId);
 
         const resolvedServiceId = await _resolveServiceIdInternal(serviceId);
-        if (!resolvedServiceId) return { status: "ERROR", data: null, error: { code: "SERVICE_NOT_FOUND", message: "Service ID not found" } };
+        if (!resolvedServiceId) return { status: "ERROR", data: null, error: { code: "SERVICE_NOT_FOUND", message: "Servicio no encontrado." } };
 
         const svcRes = await _getServiceBySlugOrIdInternal(resolvedServiceId, traceId);
         const serviceCfg = svcRes?.data;
-        if (!serviceCfg) return { status: "ERROR", data: null, error: { code: "SERVICE_CONFIG_MISSING", message: "Service not in catalog" } };
+        if (!serviceCfg) return { status: "ERROR", data: null, error: { code: "SERVICE_CONFIG_MISSING", message: "Servicio no disponible en el catalogo." } };
 
         const addonContext = _resolveAddonContext(serviceCfg, addonIds);
         const dateYMD = String(start1).slice(0, 10);
@@ -1263,7 +1371,7 @@ export const resolveStaffForSlot = webMethod(Permissions.Anyone, async (serviceI
         const slotF1Raw = (slotsF1 || []).find(
             (s) => _normalizeLocalIsoStr(s.localStartDate) === _normalizeLocalIsoStr(start1)
         );
-        if (!slotF1Raw) return { status: "ERROR", data: null, error: { code: "SLOT_UNAVAILABLE", message: "F1 slot is no longer available." } };
+        if (!slotF1Raw) return { status: "ERROR", data: null, error: { code: "SLOT_UNAVAILABLE", message: "El horario de la primera fase ya no esta disponible." } };
 
         const slotF1 = _attachServiceId(slotF1Raw, resolvedServiceId, traceId, "resolveStaff:F1Norm");
         let candidateResourceIds = _getResourceIdsFromSlot(slotF1);
@@ -1272,11 +1380,11 @@ export const resolveStaffForSlot = webMethod(Permissions.Anyone, async (serviceI
         let slotF2 = null;
         if (linkedServiceId) {
             if (!dualContext?.start2) {
-                return { status: "ERROR", data: null, error: { code: "F2_SLOT_REQUIRED", message: "Dual service requires the certified F2 slot." } };
+                return { status: "ERROR", data: null, error: { code: "F2_SLOT_REQUIRED", message: "El servicio dual requiere el slot certificado de la segunda fase." } };
             }
             const requestedF2Start = _normalizeLocalIsoStr(dualContext.start2);
             if (!requestedF2Start || requestedF2Start.slice(0, 10) !== dateYMD) {
-                return { status: "ERROR", data: null, error: { code: "F2_DIFFERENT_DAY", message: "F2 must occur on the same Madrid day as F1." } };
+                return { status: "ERROR", data: null, error: { code: "F2_DIFFERENT_DAY", message: "La segunda fase debe realizarse en la misma jornada que la primera." } };
             }
             const nextF2 = await _findNextSlotForServiceInternal(
                 linkedServiceId,
@@ -1291,29 +1399,29 @@ export const resolveStaffForSlot = webMethod(Permissions.Anyone, async (serviceI
                 nextF2.data.dayYMD !== dateYMD ||
                 _normalizeLocalIsoStr(nextF2.data.slot.localStartDate) !== requestedF2Start
             ) {
-                return { status: "ERROR", data: null, error: { code: "F2_UNAVAILABLE", message: "F2 slot is no longer available." } };
+                return { status: "ERROR", data: null, error: { code: "F2_UNAVAILABLE", message: "El horario de la segunda fase ya no esta disponible." } };
             }
             slotF2 = nextF2.data.slot;
             const candidatesF2 = _getResourceIdsFromSlot(slotF2);
             candidateResourceIds = candidateResourceIds.filter(id => candidatesF2.includes(id));
         } else if (dualContext?.start2) {
-            return { status: "ERROR", data: null, error: { code: "UNEXPECTED_F2_CONTEXT", message: "Simple service cannot include F2 context." } };
+            return { status: "ERROR", data: null, error: { code: "UNEXPECTED_F2_CONTEXT", message: "Un servicio simple no puede incluir contexto de segunda fase." } };
         }
 
         if (!candidateResourceIds.length) {
-            return { status: "ERROR", data: null, error: { code: "STAFF_NOT_AVAILABLE", message: "No staff available for this combined slot." } };
+            return { status: "ERROR", data: null, error: { code: "STAFF_NOT_AVAILABLE", message: "No hay personal disponible para este horario combinado." } };
         }
 
         const requestedResourceId = isAnyStaff ? "" : _safeTrim(rId);
         if (requestedResourceId && !candidateResourceIds.includes(requestedResourceId)) {
-            return { status: "ERROR", data: null, error: { code: "STAFF_NOT_AVAILABLE", message: "Selected staff is not available for this combined slot." } };
+            return { status: "ERROR", data: null, error: { code: "STAFF_NOT_AVAILABLE", message: "La profesional seleccionada no esta disponible para este horario combinado." } };
         }
 
         const finalResourceId = isAnyStaff ?
             await _pickLeastLoadedResource(candidateResourceIds, dateYMD, traceId) :
             requestedResourceId;
 
-        if (!finalResourceId) return { status: "ERROR", data: null, error: { code: "STAFF_NOT_AVAILABLE", message: "No staff could be assigned." } };
+        if (!finalResourceId) return { status: "ERROR", data: null, error: { code: "STAFF_NOT_AVAILABLE", message: "No se pudo asignar una profesional para este horario." } };
 
         const finalResourceName = (await _getStaffDisplayName(finalResourceId)) || STAFF_DEFAULT_NAME;
 
