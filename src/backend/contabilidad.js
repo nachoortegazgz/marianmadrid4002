@@ -1,29 +1,22 @@
-/**
- * =============================================================================
- * MODULE: backend/contabilidad.js
- * RESPONSIBILITY: Idempotent accounting journal projection from immutable cash
- * ledger movements. Projection stays disabled until an approved account map
- * exists in PLAN_CUENTAS_CONTABLES.
- * STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
- * =============================================================================
- */
+/*
+=============================================================================
+MODULE: backend/contabilidad.js
+VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-accounting)
+RESPONSIBILITY: Idempotent accounting journal projection from immutable cash
+            ledger movements. Projection stays disabled until an approved account map
+            exists in PLAN_CUENTAS_CONTABLES.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
 
 import wixData from "wix-data";
 import { getSecret } from "wix-secrets-backend";
-
 import { COLLECTIONS, SDK_CONFIG, TIPO_MOVIMIENTO } from "backend/internalConfig";
 import { SECRETS } from "backend/mmSecrets";
 import { hmacSha256Hex, hashChain } from "backend/securityEngine";
+import { _roundMoney, _cleanText } from "public/mmUtils";
 
 const MONEY_EPSILON = 0.005;
-
-function _roundMoney(value) {
-    return Math.round((Number(value) || 0) * 100) / 100;
-}
-
-function _cleanText(value, maxLength = 500) {
-    return String(value || "").trim().slice(0, maxLength);
-}
 
 function _normalizeDate(value) {
     const parsed = value instanceof Date ? value : new Date(value || Date.now());
@@ -105,11 +98,11 @@ async function _findAccountMap(tipoMovimiento) {
 }
 
 async function _getExisting(id) {
-    return await wixData.get(COLLECTIONS.ASIENTOS_CONTABLES, id, { suppressAuth: true }).catch(() => null);
+    return await wixData.get(COLLECTIONS.ASIENTOS_CONTABLES, id, { suppressAuth: true, consistentRead: true }).catch(() => null);
 }
 
 async function _insertLineIfMissing(line) {
-    const existing = await wixData.get(COLLECTIONS.LINEAS_ASIENTO_CONTABLE, line._id, { suppressAuth: true }).catch(() => null);
+    const existing = await wixData.get(COLLECTIONS.LINEAS_ASIENTO_CONTABLE, line._id, { suppressAuth: true, consistentRead: true }).catch(() => null);
     if (existing) return { idempotent: true };
     await wixData.insert(COLLECTIONS.LINEAS_ASIENTO_CONTABLE, line, { suppressAuth: true });
     return { idempotent: false };

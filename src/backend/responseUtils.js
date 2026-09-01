@@ -1,5 +1,17 @@
-﻿import { _cloneDeep, _safeTrim } from "public/mmUtils";
+/*
+=============================================================================
+MODULE: backend/responseUtils.js
+VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-response-utils)
+RESPONSIBILITY: Centralized response standardization, AppError class,
+            and webMethod error handling helpers.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
+
+import { _cloneDeep, _safeTrim } from "public/mmUtils";
+
 const MAX_ERROR_MESSAGE_LENGTH = 500;
+
 export class AppError extends Error {
     constructor(code = "INTERNAL_ERROR", message = "Error interno", meta = {}) {
         super(String(message || "Error interno"));
@@ -9,6 +21,7 @@ export class AppError extends Error {
         if (Error.captureStackTrace) Error.captureStackTrace(this, AppError);
     }
 }
+
 export function successResponse(data = null, metaExtra = {}) {
     const extra = metaExtra && typeof metaExtra === "object" ? _cloneDeep(metaExtra) : {};
     return {
@@ -18,6 +31,7 @@ export function successResponse(data = null, metaExtra = {}) {
         error: null,
     };
 }
+
 export function errorResponse(code = "INTERNAL_ERROR", message = "Error inesperado", metaExtra = {}) {
     let finalCode = code;
     let finalMsg = message;
@@ -47,12 +61,14 @@ export function errorResponse(code = "INTERNAL_ERROR", message = "Error inespera
         },
     };
 }
+
 export function _toPublicError(err, fallbackCode = "INTERNAL_ERROR", fallbackMessage = "Error interno") {
     return {
         code: String(err?.code || fallbackCode),
         message: String(err?.message || fallbackMessage),
     };
 }
+
 export function toWebMethodResult(actionFn) {
     return async (...args) => {
         try {
@@ -66,6 +82,7 @@ export function toWebMethodResult(actionFn) {
         }
     };
 }
+
 export function isSuccess(res) {
     if (!res) return false;
     if (res === true) return true;

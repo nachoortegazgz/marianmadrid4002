@@ -124,7 +124,6 @@ export const registerInternalInventoryUse = webMethod(Permissions.SiteMember, as
                     ""
                 );
 
-                // Optimistic CAS check
                 const freshCheck = await withTimeout(
                     wixData.get(PRODUCTOS_COL, product._id, { suppressAuth: true, consistentRead: true }).catch(() => null),
                     CMS_TIMEOUT_MS,
@@ -256,7 +255,6 @@ export const registerInventoryReceipt = webMethod(Permissions.SiteMember, async 
                     ""
                 );
 
-                // Optimistic CAS check
                 const freshCheck = await withTimeout(
                     wixData.get(PRODUCTOS_COL, product._id, { suppressAuth: true, consistentRead: true }).catch(() => null),
                     CMS_TIMEOUT_MS,

@@ -219,7 +219,7 @@ async function _postListItem(config, token, payload) {
         "m365GraphListItem"
     );
 
-    const status = Number(response?.status) || 0;
+    const status = response ? Number(response.status) || 500 : 500;
     if (status === 409) return { externalRecordId: "", duplicate: true };
     if (!response?.ok) throw new Error(`M365_GRAPH_POST_${status}`);
     const data = await response.json().catch(() => ({}));
