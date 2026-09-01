@@ -1,11 +1,13 @@
 /*
 =============================================================================
 MODULE: public/mmUtils.js
-VERSION: marianmadrid4003 (v21.1.1-LTS-remediated-eslint)
+VERSION: marianmadrid4004 (v21.1.2-LTS-remediated-canonical)
 RESPONSIBILITY: Universal shared utility library for Frontend and Backend.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
+
+export const TZ = "Europe/Madrid";
 
 export const STAFF_DEFAULT_NAME = "Cualquier Profesional";
 
