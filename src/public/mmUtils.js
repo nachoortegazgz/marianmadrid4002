@@ -1,7 +1,7 @@
 /*
 =============================================================================
 MODULE: public/mmUtils.js
-VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-shared-utils-unified)
+VERSION: marianmadrid4003 (v21.1.1-LTS-remediated-eslint)
 RESPONSIBILITY: Universal shared utility library for Frontend and Backend.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
@@ -17,36 +17,6 @@ export const MONEY = Object.freeze({
 
 export const BOOKINGS_ADDON_CONFIG = Object.freeze({
     MAX_PER_BOOKING: 5,
-});
-
-export const URLS = Object.freeze({
-    SERVICIOS: "/reserva-online",
-    CALENDARIO_2: "/booking-calendar/calendario-2",
-    DETALLE_SERVICIO: "/servicio-2",
-    PRIVACY_POLICY: "/politica-de-privacidad",
-});
-
-export const UI = Object.freeze({
-    SALON_LOCATION_LABEL: "Marian Madrid Peluqueria y Estetica",
-    DEFAULT_SERVICE_IMAGE_URL: "https://static.wixstatic.com/media/ab7708_374e5f7adb2f47f3944f3355da129b80~mv2.jpg",
-    FRONTEND_API_TIMEOUT_MS: 15000,
-    FRONTEND_RETRY_ATTEMPTS: 3,
-    FRONTEND_RETRY_BASE_BACKOFF_MS: 500,
-    HANDSHAKE_TIMEOUT_MS: 15000,
-    CONTEXT_TIMEOUT_MS: 20000,
-});
-
-export const MESSAGE_TYPES = Object.freeze({
-    READY: "MM_READY",
-    CONTEXT: "MM_CONTEXT",
-    AVAIL: "MM_AVAIL",
-    SELECT: "MM_SELECT",
-    BOOK: "MM_BOOK",
-    NAV: "MM_NAV",
-});
-
-export const SDK_CONFIG = Object.freeze({
-    TZ: "Europe/Madrid",
 });
 
 export function _safeTrim(value) {
@@ -107,20 +77,6 @@ export function _cleanText(value, maxLength = 500) {
     return _safeTrim(value).slice(0, maxLength);
 }
 
-export function _normType(type) {
-    return String(type || "").trim().toUpperCase();
-}
-
-export function _readPositiveAmount(value) {
-    const num = Number(value);
-    return Number.isFinite(num) && num > 0 ? _roundMoney(num) : 0;
-}
-
-export function _readDate(value) {
-    const clean = _safeTrim(value);
-    return /^\d{4}-\d{2}-\d{2}$/.test(clean) ? clean : "";
-}
-
 export function _stableSerialize(obj) {
     if (obj === null || typeof obj !== "object") {
         return JSON.stringify(obj);
@@ -162,10 +118,43 @@ export function getUtcDateFromMadridLocal(localIsoStr) {
     const min = Number(match[5]);
     const sec = Number(match[6] || 0);
 
-    const assumedUtc = new Date(Date.UTC(year, month - 1, day, hour, min, sec));
-    const invDate = new Date(assumedUtc.toLocaleString("en-US", { timeZone: "Europe/Madrid" }));
-    const diff = assumedUtc.getTime() - invDate.getTime();
-    return new Date(assumedUtc.getTime() + diff);
+    let guessUtc = new Date(Date.UTC(year, month - 1, day, hour, min, sec));
+
+    const formatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: "Europe/Madrid",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+    });
+
+    const getParts = (d) => {
+        const parts = formatter.formatToParts(d);
+        const map = {};
+        parts.forEach((p) => { map[p.type] = p.value; });
+        const h = map.hour === "24" ? 0 : Number(map.hour);
+        return {
+            year: Number(map.year),
+            month: Number(map.month),
+            day: Number(map.day),
+            hour: h,
+            min: Number(map.minute),
+            sec: Number(map.second || 0),
+        };
+    };
+
+    for (let i = 0; i < 3; i++) {
+        const p = getParts(guessUtc);
+        const diffMs = Date.UTC(year, month - 1, day, hour, min, sec) -
+                       Date.UTC(p.year, p.month - 1, p.day, p.hour, p.min, p.sec);
+        if (diffMs === 0) break;
+        guessUtc = new Date(guessUtc.getTime() + diffMs);
+    }
+
+    return guessUtc;
 }
 
 export function getMadridLocalStringNoZ(date) {
@@ -231,11 +220,32 @@ export function _maskIp(ip) {
 export function makeTraceId(prefix = "tr") {
     const p = _normalizeIdPart(prefix, 10);
     const ts = Date.now().toString(36);
-    const rnd = Math.random().toString(36).slice(2, 8);
+    const rnd = _generateUUID().replace(/-/g, "").slice(0, 6);
     return `${p}-${ts}-${rnd}`;
 }
 
 export function _generateUUID() {
+    try {
+        const nodeCrypto = require("crypto");
+        if (nodeCrypto && typeof nodeCrypto.randomUUID === "function") {
+            return nodeCrypto.randomUUID();
+        }
+    } catch (_) {}
+    try {
+        if (typeof crypto !== "undefined") {
+            if (typeof crypto.randomUUID === "function") {
+                return crypto.randomUUID();
+            }
+            if (typeof crypto.getRandomValues === "function") {
+                const buf = new Uint8Array(16);
+                crypto.getRandomValues(buf);
+                buf[6] = (buf[6] & 0x0f) | 0x40;
+                buf[8] = (buf[8] & 0x3f) | 0x80;
+                const hex = Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+                return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+            }
+        }
+    } catch (_) {}
     return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
         const r = (Math.random() * 16) | 0;
         const v = c === "x" ? r : (r & 0x3) | 0x8;
@@ -302,5 +312,11 @@ export async function _executeWithRetry(fn, retries = 3, delayMs = 500) {
 
 export function _cloneDeep(obj) {
     if (obj === null || typeof obj !== "object") return obj;
-    return JSON.parse(JSON.stringify(obj));
+    if (obj instanceof Date) return new Date(obj.getTime());
+    if (Array.isArray(obj)) return obj.map((item) => _cloneDeep(item));
+    const copy = {};
+    for (const key of Object.keys(obj)) {
+        copy[key] = _cloneDeep(obj[key]);
+    }
+    return copy;
 }
