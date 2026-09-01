@@ -1,9 +1,9 @@
 /*
 =============================================================================
 MODULE: backend/security.js
-VERSION: marianmadrid4002 (v21.1.0-LTS-remediated)
+VERSION: marianmadrid4003 (v21.1.2-LTS-remediated-phase3-lru-cache)
 RESPONSIBILITY: RBAC (roles + allowlists) and surface-scoped sliding window rate limiter
-            with email validation and bounded cache management.
+            with email validation and true O(1) LRU bounded cache management.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
@@ -81,17 +81,11 @@ function _pruneExpiredRateLimitEntries(now) {
 function _ensureRateLimitCapacity(now) {
     if (_rateLimitCache.size < MAX_RATE_LIMIT_CACHE_SIZE) return;
     _pruneExpiredRateLimitEntries(now);
-    if (_rateLimitCache.size < MAX_RATE_LIMIT_CACHE_SIZE) return;
-    let oldestKey = null;
-    let oldestLastSeen = Number.POSITIVE_INFINITY;
-    for (const [cacheKey, cacheEntry] of _rateLimitCache) {
-        const lastSeen = Number(cacheEntry.lastSeen || cacheEntry.windowStart) || 0;
-        if (lastSeen < oldestLastSeen) {
-            oldestLastSeen = lastSeen;
-            oldestKey = cacheKey;
-        }
+    while (_rateLimitCache.size >= MAX_RATE_LIMIT_CACHE_SIZE) {
+        const oldestKey = _rateLimitCache.keys().next().value;
+        if (!oldestKey) break;
+        _rateLimitCache.delete(oldestKey);
     }
-    if (oldestKey) _rateLimitCache.delete(oldestKey);
 }
 
 export function rateLimiter(key, maxRequests, windowMs) {
@@ -122,6 +116,10 @@ export function rateLimiter(key, maxRequests, windowMs) {
 
     entry.lastSeen = now;
     entry.count++;
+
+    // Re-insert to maintain true O(1) LRU eviction order
+    _rateLimitCache.delete(k);
+    _rateLimitCache.set(k, entry);
 
     if (entry.count > maxReq) {
         const retryAfter = entry.windowMs - (now - entry.windowStart);

@@ -1,10 +1,9 @@
 /*
 =============================================================================
 MODULE: backend/horario.web.js
-VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-labor-registry-deterministic)
+VERSION: marianmadrid4003 (v21.1.2-LTS-remediated-phase1-fixes)
 RESPONSIBILITY: Employee time tracking and labor registry (RD-Ley 8/2019):
-            clock-in, clock-out, break tracking, workload calculation,
-            and deterministic report snapshotting with cutoff timestamps.
+            clock-in, clock-out, break tracking, workload calculation, with mutex concurrency lock.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
@@ -17,7 +16,6 @@ import {
     makeTraceId,
     _safeTrim,
     _maskIp,
-    _toDateSafe,
     getMadridLocalStringNoZ,
     withTimeout,
 } from "public/mmUtils";
@@ -26,13 +24,21 @@ import {
     TIPO_FICHAJE,
     SDK_CONFIG,
 } from "backend/internalConfig";
-import { logger, BookingError, ERROR_CODES, normalizeError } from "backend/booking/bookingCore";
+import {
+    logger,
+    BookingError,
+    ERROR_CODES,
+    normalizeError,
+    _lockSlotKeyOrFail,
+    _unlockSlotKey,
+} from "backend/booking/bookingCore";
 import { findStaff, getAllStaff } from "backend/staff";
 import { isAdmin, rateLimiter } from "backend/security";
 
 const log = logger;
 const REGISTRO_COL = COLLECTIONS.REGISTRO_HORARIO;
 const API_TIMEOUT_MS = Number(SDK_CONFIG?.TIMEOUTS?.WEBHOOK_MS) || 30000;
+const CLOCK_LOCK_TTL_MS = 30000;
 
 function _rateLimitOrThrow(surface, key, traceId) {
     const rl = rateLimiter({ surface, key });
@@ -73,7 +79,8 @@ async function _validateMemberAndResource(resourceId, traceId) {
         throw new BookingError(ERROR_CODES.AUTH_REQUIRED, "Inicio de sesion requerido.", { traceId });
     }
 
-    if (await isAdmin(traceId)) {
+    const memberIsAdmin = await isAdmin(traceId).catch(() => false);
+    if (memberIsAdmin) {
         return {
             registradoPor: "ADMIN",
             registradoPorMemberId: _safeTrim(member._id) || null,
@@ -103,9 +110,6 @@ async function _validateMemberAndResource(resourceId, traceId) {
     };
 }
 
-/**
- * PATCH 002: Excluye AJUSTE de la consulta del ultimo fichaje para preservar el turno activo.
- */
 async function _getEstadoJornadaInternal(resourceId, traceId) {
     const cleanId = await _validateResourceId(resourceId, traceId);
 
@@ -179,18 +183,25 @@ async function _getHistorialFichajesInternal(resourceId, startDateYMD, endDateYM
 
     let page = 2;
     const maxPages = 10;
+    let hasMore = Boolean(res && res.hasNext());
 
-    while (res && res.hasNext() && page <= maxPages) {
+    while (hasMore && page <= maxPages) {
         res = await withTimeout(
-            res.next(),
+            res.next({ suppressAuth: true }),
             API_TIMEOUT_MS,
             `queryHistorialFichajesInternal_p${page}`
         );
         allItems = allItems.concat(res?.items || []);
+        hasMore = Boolean(res && res.hasNext());
         page++;
     }
 
-    return allItems;
+    return {
+        items: allItems,
+        totalItems: allItems.length,
+        truncated: hasMore,
+        pagesScanned: page - 1,
+    };
 }
 
 async function _registrarFichajeInternal(payload, traceId) {
@@ -198,65 +209,80 @@ async function _registrarFichajeInternal(payload, traceId) {
     _rateLimitOrThrow("horario.registrarFichaje", resourceId, traceId);
     const actor = await _validateMemberAndResource(resourceId, traceId);
 
-    const tipo = String(payload.tipoFichaje || payload.tipo || "").trim().toUpperCase();
-    const validTypes = Object.values(TIPO_FICHAJE);
-    if (!validTypes.includes(tipo)) {
-        throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, `Tipo de fichaje invalido: "${tipo}".`, { traceId });
+    const lockKey = `clock_${resourceId}`;
+    const lockOwnerId = `${traceId}:${resourceId}`;
+    const lockResult = await _lockSlotKeyOrFail(lockKey, lockOwnerId, CLOCK_LOCK_TTL_MS);
+    if (!lockResult?.ok) {
+        throw new BookingError(
+            ERROR_CODES.TOKEN_BUSY,
+            "Hay un registro de fichaje en curso para este profesional. Reintenta en unos segundos.",
+            { traceId }
+        );
     }
 
-    const estadoJornada = await _getEstadoJornadaInternal(resourceId, traceId);
+    try {
+        const tipo = String(payload.tipoFichaje || payload.tipo || "").trim().toUpperCase();
+        const validTypes = Object.values(TIPO_FICHAJE);
+        if (!validTypes.includes(tipo)) {
+            throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, `Tipo de fichaje invalido: "${tipo}".`, { traceId });
+        }
 
-    if (tipo === TIPO_FICHAJE.ENTRADA && estadoJornada.enJornada) {
-        throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, "El profesional ya tiene un turno activo.", { traceId });
-    } else if (tipo === TIPO_FICHAJE.SALIDA && !estadoJornada.enJornada) {
-        throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, "No hay un turno activo para cerrar.", { traceId });
-    } else if (tipo === TIPO_FICHAJE.PAUSA_INICIO && (!estadoJornada.enJornada || estadoJornada.enPausa)) {
-        throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, "No se puede iniciar una pausa sin un turno activo.", { traceId });
-    } else if (tipo === TIPO_FICHAJE.PAUSA_FIN && !estadoJornada.enPausa) {
-        throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, "No se puede finalizar una pausa que no se ha iniciado.", { traceId });
+        const estadoJornada = await _getEstadoJornadaInternal(resourceId, traceId);
+
+        if (tipo === TIPO_FICHAJE.ENTRADA && estadoJornada.enJornada) {
+            throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, "El profesional ya tiene un turno activo.", { traceId });
+        } else if (tipo === TIPO_FICHAJE.SALIDA && !estadoJornada.enJornada) {
+            throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, "No hay un turno activo para cerrar.", { traceId });
+        } else if (tipo === TIPO_FICHAJE.PAUSA_INICIO && (!estadoJornada.enJornada || estadoJornada.enPausa)) {
+            throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, "No se puede iniciar una pausa sin un turno activo.", { traceId });
+        } else if (tipo === TIPO_FICHAJE.PAUSA_FIN && !estadoJornada.enPausa) {
+            throw new BookingError(ERROR_CODES.INVALID_CLOCK_TYPE, "No se puede finalizar una pausa que no se ha iniciado.", { traceId });
+        }
+
+        const ahora = new Date();
+        const madridStr = getMadridLocalStringNoZ(ahora);
+        const diaKey = madridStr.slice(0, 10);
+        const mesKey = madridStr.slice(0, 7);
+        const hora = madridStr.slice(11, 19);
+
+        const resourceName = await _resolveResourceName(resourceId);
+
+        const record = {
+            resourceId,
+            resourceName,
+            tipoFichaje: tipo,
+            diaKey,
+            mesKey,
+            hora,
+            fechaHora: ahora,
+            ipDispositivo: _maskIp(payload.ipDispositivo || "CONTAINER_SYSTEM"),
+            motivoAjuste: _safeTrim(payload.motivoAjuste) || null,
+            registradoPor: actor.registradoPor,
+            registradoPorMemberId: actor.registradoPorMemberId,
+        };
+
+        const inserted = await withTimeout(
+            wixData.insert(REGISTRO_COL, record, { suppressAuth: true }),
+            API_TIMEOUT_MS,
+            "insertFichaje"
+        );
+
+        return {
+            status: "SUCCESS",
+            data: {
+                _id: inserted._id,
+                resourceId: inserted.resourceId,
+                resourceName: inserted.resourceName,
+                tipoFichaje: inserted.tipoFichaje,
+                fechaHora: inserted.fechaHora || ahora,
+                diaKey: inserted.diaKey,
+                hora: inserted.hora,
+            },
+            error: null,
+        };
+    } finally {
+        await _unlockSlotKey(lockKey, lockOwnerId).catch(() => {});
     }
-
-    const ahora = new Date();
-    const madridStr = getMadridLocalStringNoZ(ahora);
-    const diaKey = madridStr.slice(0, 10);
-    const mesKey = madridStr.slice(0, 7);
-    const hora = madridStr.slice(11, 19);
-
-    const resourceName = await _resolveResourceName(resourceId);
-
-    const record = {
-        resourceId,
-        resourceName,
-        tipoFichaje: tipo,
-        diaKey,
-        mesKey,
-        hora,
-        fechaHora: ahora,
-        ipDispositivo: _maskIp(payload.ipDispositivo || "CONTAINER_SYSTEM"),
-        motivoAjuste: _safeTrim(payload.motivoAjuste) || null,
-        registradoPor: actor.registradoPor,
-        registradoPorMemberId: actor.registradoPorMemberId,
-    };
-
-    const inserted = await withTimeout(
-        wixData.insert(REGISTRO_COL, record, { suppressAuth: true }),
-        API_TIMEOUT_MS,
-        "insertFichaje"
-    );
-
-    return {
-        status: "SUCCESS",
-        data: {
-            _id: inserted._id,
-            resourceId: inserted.resourceId,
-            resourceName: inserted.resourceName,
-            tipoFichaje: inserted.tipoFichaje,
-            fechaHora: inserted.fechaHora || ahora,
-            diaKey: inserted.diaKey,
-            hora: inserted.hora,
-        },
-        error: null,
-    };
 }
 
 export const getMyStaffContext = webMethod(Permissions.SiteMember, async (options = {}) => {
@@ -335,8 +361,8 @@ export const getHistorialFichajes = webMethod(
             const cleanId = await _validateResourceId(resourceId, traceId);
             await _validateMemberAndResource(cleanId, traceId);
 
-            const items = await _getHistorialFichajesInternal(cleanId, startDateYMD, endDateYMD, traceId);
-            return { status: "SUCCESS", data: items, error: null };
+            const result = await _getHistorialFichajesInternal(cleanId, startDateYMD, endDateYMD, traceId);
+            return { status: "SUCCESS", data: result, error: null };
         } catch (error) {
             const normalized = normalizeError(error);
             return { status: "ERROR", data: null, error: { code: normalized.code, message: normalized.message } };
@@ -352,10 +378,8 @@ export const calcularHorasTrabajadas = webMethod(
             const cleanId = await _validateResourceId(resourceId, traceId);
             await _validateMemberAndResource(cleanId, traceId);
 
-            const items = await _getHistorialFichajesInternal(cleanId, startDateYMD, endDateYMD, traceId);
-
-            const cutoffDate = options.hastaFechaHora ? _toDateSafe(options.hastaFechaHora) : null;
-            const nowMs = (cutoffDate && !isNaN(cutoffDate.getTime())) ? cutoffDate.getTime() : Date.now();
+            const historyResult = await _getHistorialFichajesInternal(cleanId, startDateYMD, endDateYMD, traceId);
+            const items = Array.isArray(historyResult?.items) ? historyResult.items : [];
 
             let totalWorkedMs = 0;
             let totalBreakMs = 0;
@@ -367,7 +391,6 @@ export const calcularHorasTrabajadas = webMethod(
                 const rawDate = item.fechaHora || item._createdDate;
                 const time = rawDate ? new Date(rawDate).getTime() : NaN;
                 if (isNaN(time)) continue;
-                if (time > nowMs) continue;
 
                 const tipo = String(item.tipoFichaje || "").toUpperCase();
 
@@ -404,10 +427,11 @@ export const calcularHorasTrabajadas = webMethod(
                 }
             }
 
-            const todayYMD = getMadridLocalStringNoZ(new Date(nowMs)).slice(0, 10);
+            const todayYMD = getMadridLocalStringNoZ(new Date()).slice(0, 10);
             const rangeIncludesToday = !endDateYMD || _safeTrim(endDateYMD) >= todayYMD;
             const hasOpenShiftOutsideRequestedRange = currentShiftStart !== null && !rangeIncludesToday;
             if (currentShiftStart !== null && rangeIncludesToday) {
+                const nowMs = Date.now();
                 if (currentBreakStart !== null) {
                     const breakDuration = nowMs - currentBreakStart;
                     if (breakDuration > 0) currentShiftBreakMs += breakDuration;
@@ -428,17 +452,13 @@ export const calcularHorasTrabajadas = webMethod(
                 status: "SUCCESS",
                 data: {
                     resourceId: cleanId,
-                    periodo: {
-                        desde: startDateYMD || null,
-                        hasta: endDateYMD || null,
-                        fechaCorteCalculo: new Date(nowMs).toISOString(),
-                        congelado: Boolean(cutoffDate),
-                    },
+                    periodo: { desde: startDateYMD, hasta: endDateYMD },
                     horasTrabajadasDecimal: workedHoursDecimal,
                     horasPausaDecimal: breakHoursDecimal,
                     tiempoFormateado: `${hoursInt}h ${minutesInt}m`,
                     totalFichajesProcesados: items.length,
                     turnoAbiertoFueraDeRango: hasOpenShiftOutsideRequestedRange,
+                    truncated: historyResult.truncated,
                 },
                 error: null,
             };

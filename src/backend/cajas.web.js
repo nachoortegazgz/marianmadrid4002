@@ -1,7 +1,7 @@
 /*
 =============================================================================
 MODULE: backend/cajas.web.js
-VERSION: marianmadrid4002 (v21.1.0-LTS-remediated)
+VERSION: marianmadrid4003 (v21.1.2-LTS-remediated-phase2-deterministic-hash)
 RESPONSIBILITY: Internal financial ledger with SHA-256 hash chains,
             idempotent transaction recording, and chain integrity verification.
             Complies with Veri*Factu and RD-Ley 8/2019 principles.
@@ -801,7 +801,7 @@ export async function _registerZClosingInternal(diaKey, options = {}) {
         const source = options.autoCron ? "CRON" : "ADMIN";
         const summary = _buildZClosingSummary(diaKey, items, integrity, source);
         const fiscalKey = await _getCachedCashierSecret();
-        const hashCierre = hashChain(summary.hashFin, JSON.stringify(summary));
+        const hashCierre = hashChain(summary.hashFin, _stableSerialize(summary));
         const firmaCierre = hmacSha256Hex(fiscalKey, hashCierre);
         const record = {
             _id: zId,

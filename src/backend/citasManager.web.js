@@ -1,33 +1,17 @@
-/**
- * =============================================================================
- * MODULE: backend/citasManager.web.js
- * VERSION: v20.0.0-dual-reschedule-cache-invalidation
- * RESPONSIBILITY: Thin Velo V3 Web Module facade for transactional booking
- * orchestration, payment confirmation, and reschedule.
- * STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
- * HISTORIAL:
- * - v20.0.0-dual-reschedule-cache-invalidation: Adds proactive dual availability cache
- *   invalidation for both services and dates upon successful dual reschedule.
- * - v19.6.14-canonical-booking-payload: Removes legacy add-on id and dual slot aliases from public reschedule handling.
- * - v19.6.7-writer-slot-native-id: Emits native _id fields for Writer V2 reschedule resource and location payloads.
- * - v19.6.3-prioritized-reliability-refactor: Removes duplicated catalog and slot paths, restores Codegem fixes, and hardens persistence.
- * - v19.6.2-serviceid-linkfases-contract: Uses serviceId and derives F2 only from Import2.linkFases.
- * - v19.6.0-writer-v2-payment-and-addon-alignment: Does not call Confirm Or Decline after Wix eCommerce checkout and revalidates F1 reschedules with its persisted native add-ons.
- * - v19.5.4-payment-and-location-context: Uses the Bookings Writer V2 location enum for dual reschedule rollback slots.
- * - v19.5.3: Verifies an elevated Wix order, booking line items, and amount before payment confirmation; holds CitasF2 in PENDING_LEDGER until fiscal registration succeeds.
- * - v19.4.4: Generates public booking trace IDs server-side; never trusts client trace input.
- * - v19.4.4: Rejects legacy service and resource aliases at the public booking boundary.
- * - v19.4.4: Dual reschedule derives F2 GUID, phase durations, and gap solely from Import2.
- * - v19.2.0-public-boundary-hardened: Adds public booking rate-limit enforcement and canonical payment-state handling.
- * - v19.1.1-v3-v2-contract-aligned: Uses the documented rescheduleBooking argument separation.
- * =============================================================================
- */
+/*
+=============================================================================
+MODULE: backend/citasManager.web.js
+VERSION: marianmadrid4004 (v21.1.2-LTS-remediated-phase1-fixes)
+RESPONSIBILITY: Thin Velo V3 Web Module facade for transactional booking
+            orchestration, payment confirmation, and reschedule.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
 
 import { webMethod, Permissions } from "wix-web-module";
 import wixData from "wix-data";
 import { orders } from "wix-ecom-backend";
 import { elevate } from "wix-auth";
-
 import {
     makeTraceId,
     _safeTrim,
@@ -37,6 +21,8 @@ import {
     getMadridLocalStringNoZ,
     withTimeout,
     _executeWithRetry,
+    _roundMoney,
+    _extractRelationalId,
 } from "public/mmUtils";
 import {
     COLLECTIONS,
@@ -47,7 +33,6 @@ import {
     ESTADO_CITA,
     ESTADO_PAGO,
 } from "backend/internalConfig";
-
 import {
     rescheduleBookingElevated,
     _projectWriterSlotFromAvailability,
@@ -56,16 +41,16 @@ import {
     _renewLock,
     _generateSlotKey,
     _handleError,
+    _updateCitaSafe,
     logger,
 } from "backend/booking/bookingCore";
-
 import { executeBookingSaga } from "backend/booking/bookingSaga";
 import { registerBookingPayment, queueFiscalRecovery } from "backend/cajas.web";
 import { requireAdmin, isAdmin, rateLimiter } from "backend/security";
+import { _toPublicError } from "backend/responseUtils";
 import { getServiceForBookingInternal, _invalidateCachesInternal, revalidateExactAvailabilitySlot } from "backend/reservas.web";
 
 const log = logger;
-
 const CITAS_COLLECTION = COLLECTIONS.CITAS;
 const AUDIT_LOG_COL = COLLECTIONS.AUDIT_LOG;
 const API_TIMEOUT_MS = SDK_CONFIG?.TIMEOUTS?.API_MS || 15000;
@@ -73,34 +58,29 @@ const getOrderElevated = elevate(orders.getOrder);
 
 function _getNativeAddonIdsForRevalidation(cita) {
     if (String(cita?.tipo || "") === "dual_fase2") return [];
-
     const bookedAddOns = Array.isArray(cita?.meta?.nativeBookedAddOns) ? cita.meta.nativeBookedAddOns : [];
     return Array.from(new Set(
         bookedAddOns
-        .map((addon) => _safeTrim(addon?._id || addon))
-        .filter((addonId) => _looksLikeGuid(addonId))
+            .map((addon) => _safeTrim(addon?._id || addon))
+            .filter((addonId) => _looksLikeGuid(addonId))
     )).sort();
 }
 
 async function _findCitaByBookingId(bookingId) {
     const clean = String(bookingId || "").trim();
     if (!clean) return null;
-
     try {
         const q = await withTimeout(
-            wixData.query(CITAS_COLLECTION).eq("bookingId", clean).limit(1).find({ suppressAuth: true }),
+            wixData.query(CITAS_COLLECTION).eq("bookingId", clean).limit(1).find({ suppressAuth: true, consistentRead: true }),
             API_TIMEOUT_MS,
             "findCitaByBookingIdQuery"
         ).catch(() => null);
-
         if (q?.items?.length) return q.items[0];
-
         const byId = await withTimeout(
-            wixData.get(CITAS_COLLECTION, clean, { suppressAuth: true }),
+            wixData.get(CITAS_COLLECTION, clean, { suppressAuth: true, consistentRead: true }),
             API_TIMEOUT_MS,
             "findCitaByBookingIdGet"
         ).catch(() => null);
-
         return byId || null;
     } catch (_) {
         return null;
@@ -141,7 +121,7 @@ export const processDualBooking = webMethod(Permissions.Anyone, async (unsafePay
         const slotF1 = unsafePayload.slotF1 || {};
         const slotF2 = unsafePayload.slotF2 || null;
         const metaCita = unsafePayload.metaCita;
-        const serviceId = _safeTrim(slotF1.serviceId || metaCita.serviceId || "");
+        const serviceId = _extractRelationalId(slotF1.serviceId || metaCita.serviceId || "");
         if (!_looksLikeGuid(serviceId)) {
             return { status: "ERROR", data: null, error: { code: "SERVICE_ID_INVALID", message: "The first booking phase requires a valid serviceId." } };
         }
@@ -156,7 +136,8 @@ export const processDualBooking = webMethod(Permissions.Anyone, async (unsafePay
         const requestedStart = _safeTrim(slotF1.localStartDate || slotF1.startDate || "");
         const requestedResourceId = _safeTrim(slotF1.resourceId || slotF1.resource?.id || "");
         const rateKey = `${serviceId}:${requestedStart || "no-start"}:${requestedResourceId || "any-resource"}`;
-        const rate = rateLimiter({ surface: "public-booking", key: rateKey },
+        const rate = rateLimiter(
+            { surface: "public-booking", key: rateKey },
             Number(SDK_CONFIG?.RATE_LIMIT?.BOOKING_MAX_REQUESTS),
             Number(SDK_CONFIG?.RATE_LIMIT?.BOOKING_WINDOW_MS)
         );
@@ -167,7 +148,6 @@ export const processDualBooking = webMethod(Permissions.Anyone, async (unsafePay
                 error: { code: "RATE_LIMITED", message: "Too many booking requests. Retry later." },
             };
         }
-
         return await executeBookingSaga({ ...unsafePayload, traceId });
     } catch (error) {
         return _handleError(error, "processDualBooking(wrapper)", traceId, log);
@@ -214,8 +194,7 @@ async function _getValidatedPaidOrder(orderId, bookingIds, requestedTotalAmount)
     if (Number.isFinite(requestedAmount) && requestedAmount > 0 && Math.abs(requestedAmount - verifiedAmount) > 0.009) {
         throw new Error("ORDER_AMOUNT_MISMATCH");
     }
-
-    return { order, verifiedAmount };
+    return { order, verifiedAmount: _roundMoney(verifiedAmount) };
 }
 
 function _validatePaymentCitaSet(citas, orderId) {
@@ -234,49 +213,37 @@ function _validatePaymentCitaSet(citas, orderId) {
     return { isDual, allPaid };
 }
 
-async function _setCitasPaymentState(citas, paymentState, orderId, _traceId) {
+async function _setCitasPaymentState(citas, paymentState, orderId, traceId) {
     for (const cita of citas) {
-        const meta = cita.meta || {};
-        const { _createdDate, _updatedDate, _owner, ...safeCita } = cita;
-        const updatedCita = {
-            ...safeCita,
-            ...(paymentState === ESTADO_PAGO.PAID ? {
-                [CITA_FIELDS.STATUS]: ESTADO_CITA.CONFIRMED } : {}),
-            [CITA_FIELDS.STATUS_PAGO]: paymentState,
-            fechaActualizacion: new Date(),
-            meta: {
-                ...meta,
+        await _updateCitaSafe(cita.bookingId, (item) => {
+            const meta = item.meta || {};
+            return {
+                ...item,
+                ...(paymentState === ESTADO_PAGO.PAID ? { [CITA_FIELDS.STATUS]: ESTADO_CITA.CONFIRMED } : {}),
                 [CITA_FIELDS.STATUS_PAGO]: paymentState,
-                orderId,
-                ...(paymentState === ESTADO_PAGO.PAID ? { fechaConfirmacionPago: new Date() } : { fechaPagoRecibido: new Date() }),
-            },
-        };
-        await withTimeout(
-            wixData.update(CITAS_COLLECTION, updatedCita, { suppressAuth: true }),
-            API_TIMEOUT_MS,
-            `updateCitaPaymentState_${paymentState}`
-        );
+                meta: {
+                    ...meta,
+                    [CITA_FIELDS.STATUS_PAGO]: paymentState,
+                    orderId,
+                    ...(paymentState === ESTADO_PAGO.PAID ? { fechaConfirmacionPago: new Date() } : { fechaPagoRecibido: new Date() }),
+                },
+            };
+        }, traceId, "setCitasPaymentState");
     }
 }
 
-/**
- * Admin-only payment confirmation.
- * Validates the paid Wix eCommerce order before accepting any booking IDs or amount.
- * CitasF2 remains PENDING_LEDGER until the immutable ledger is written or recovered.
- */
 export const confirmPayment = webMethod(Permissions.Admin, async (payload = {}) => {
     const traceId = makeTraceId("payment");
     try {
         await requireAdmin(traceId);
-
         const bookingIds = Array.from(new Set(
-            Array.isArray(payload.bookingIds) ?
-            payload.bookingIds.map((id) => _safeTrim(id)).filter(Boolean) : [_safeTrim(payload.bookingIdF1), _safeTrim(payload.bookingIdF2)].filter(Boolean)
+            Array.isArray(payload.bookingIds)
+                ? payload.bookingIds.map((id) => _safeTrim(id)).filter(Boolean)
+                : [_safeTrim(payload.bookingIdF1), _safeTrim(payload.bookingIdF2)].filter(Boolean)
         ));
         if (!bookingIds.length) {
             return { status: "ERROR", data: null, error: { code: "INVALID_PAYLOAD", message: "No booking IDs provided" } };
         }
-
         const orderId = _safeTrim(payload.orderId);
         if (!orderId) {
             return { status: "ERROR", data: null, error: { code: "ORDER_ID_REQUIRED", message: "A Wix orderId is required" } };
@@ -327,7 +294,8 @@ export const confirmPayment = webMethod(Permissions.Admin, async (payload = {}) 
             await _logAuditEvent(
                 "LEDGER_REGISTRATION_FAILED",
                 "ERROR",
-                `Ledger registration queued for order ${orderId}`, { orderId, bookingIds, ledgerError: ledgerRes?.error || "Unknown ledger error", traceId },
+                `Ledger registration queued for order ${orderId}`,
+                { orderId, bookingIds, ledgerError: ledgerRes?.error || "Unknown ledger error", traceId },
                 traceId
             );
             return {
@@ -337,13 +305,11 @@ export const confirmPayment = webMethod(Permissions.Admin, async (payload = {}) 
             };
         }
 
-        // Wix eCommerce synchronizes Bookings payment and confirmation after checkout.
-        // Calling Confirm Or Decline here would contradict the native checkout flow.
         await _setCitasPaymentState(citas, ESTADO_PAGO.PAID, orderId, traceId);
         return { status: "SUCCESS", data: { ok: true, bookingIds, verifiedAmount }, error: null };
     } catch (error) {
         log.error("Error in confirmPayment(wrapper)", { error: error?.message, traceId });
-        return { status: "ERROR", data: null, error: { code: "CONFIRM_PAYMENT_FAIL", message: error?.message || String(error) } };
+        return { status: "ERROR", data: null, error: _toPublicError(error, "CONFIRM_PAYMENT_FAIL", "No se pudo confirmar el pago.") };
     }
 });
 
@@ -367,19 +333,22 @@ export const rescheduleExistingBooking = webMethod(Permissions.SiteMember, async
             };
         }
 
-        // Ownership check
         const memberIsAdmin = await isAdmin(traceId).catch(() => false);
         if (!memberIsAdmin) {
             const { currentMember } = await import("wix-members-backend");
             const member = await currentMember.getMember({ fieldsets: ["FULL"] }).catch(() => null);
-            const memberEmail = member?.loginEmail ? _safeEmail(member.loginEmail) : null;
-
-            if (!memberEmail) {
+            if (!member) {
                 return { status: "ERROR", data: null, error: { code: "AUTH_REQUIRED", message: "Could not identify logged-in user" } };
             }
-
+            const memberId = _safeTrim(member._id || member.id);
+            const memberEmail = member?.loginEmail ? _safeEmail(member.loginEmail) : "";
+            const citaMemberId = _safeTrim(citaExistente?.contactDetails?.contactId || citaExistente?.contactDetails?.memberId || citaExistente?._owner || "");
             const contactEmail = _safeEmail(citaExistente.contactDetails?.email || "");
-            if (!contactEmail || contactEmail !== memberEmail) {
+
+            const isMemberMatch = Boolean(memberId && citaMemberId && memberId === citaMemberId);
+            const isEmailMatch = Boolean(memberEmail && contactEmail && memberEmail === contactEmail);
+
+            if (!isMemberMatch && !isEmailMatch) {
                 return {
                     status: "ERROR",
                     data: null,
@@ -392,10 +361,9 @@ export const rescheduleExistingBooking = webMethod(Permissions.SiteMember, async
         if (!rev) rev = Number(citaExistente?.revision || 1) || 1;
 
         const slotObj = newSlot?.slot || newSlot;
-
-        const serviceId = _safeTrim(citaExistente.serviceId);
-        const requestedServiceId = _safeTrim(slotObj.serviceId || slotObj?.slot?.serviceId || "");
-        const resourceIdForReschedule = _safeTrim(slotObj.resourceId || slotObj.resource?.id || "");
+        const serviceId = _extractRelationalId(citaExistente.serviceId);
+        const requestedServiceId = _extractRelationalId(slotObj.serviceId || slotObj?.slot?.serviceId || "");
+        const resourceIdForReschedule = _safeTrim(slotObj.resourceId || slotObj.resource?.id || slotObj.resource?._id || "");
         if (!_looksLikeGuid(serviceId)) {
             return { status: "ERROR", data: null, error: { code: "STORED_SERVICE_INVALID", message: "The stored serviceId is invalid." } };
         }
@@ -424,8 +392,7 @@ export const rescheduleExistingBooking = webMethod(Permissions.SiteMember, async
         }
 
         const res = await _executeWithRetry(
-            () =>
-            withTimeout(
+            () => withTimeout(
                 rescheduleBookingElevated(cleanBookingId, pristineSlot, {
                     revision: String(rev),
                     flowControlSettings: { ignoreReschedulePolicy: false },
@@ -448,8 +415,8 @@ export const rescheduleExistingBooking = webMethod(Permissions.SiteMember, async
             return { status: "ERROR", data: null, error: { code: "INVALID_SLOT", message: "The reschedule slot has invalid Madrid dates." } };
         }
 
-        const updated = {
-            ...citaExistente,
+        await _updateCitaSafe(cleanBookingId, (item) => ({
+            ...item,
             startDate: startUtc,
             endDate: endUtc,
             startDateLocal,
@@ -457,20 +424,8 @@ export const rescheduleExistingBooking = webMethod(Permissions.SiteMember, async
             fechaYmdMadrid: startDateLocal.slice(0, 10),
             resourceId: resourceIdForReschedule,
             revision: newRevision,
-            fechaActualizacion: new Date(),
-        };
+        }), traceId, "rescheduleExistingBooking");
 
-        delete updated._createdDate;
-        delete updated._updatedDate;
-        delete updated._owner;
-
-        await withTimeout(
-            wixData.update(CITAS_COLLECTION, updated, { suppressAuth: true }),
-            API_TIMEOUT_MS,
-            "updateCitaRescheduled"
-        );
-
-        // Invalidate caches for both old and new dates (best-effort)
         const oldDateYMD = String(citaExistente.startDateLocal || citaExistente.fechaYmdMadrid || "").slice(0, 10);
         const oldResourceId = _safeTrim(citaExistente.resourceId);
         const newDateYMD = startDateLocal.slice(0, 10);
@@ -519,7 +474,7 @@ function _matchesCitaPairIdentifier(cita, token) {
 }
 
 function _getBookingSlotFromCita(cita) {
-    const serviceId = _safeTrim(cita?.serviceId);
+    const serviceId = _extractRelationalId(cita?.serviceId);
     const resourceId = _safeTrim(cita?.resourceId);
     const startDate = cita?.startDate;
     const endDate = cita?.endDate;
@@ -539,7 +494,7 @@ function _getBookingSlotFromCita(cita) {
 async function _buildDualRescheduleSlot(cita, inputSlot, expectedServiceId) {
     const rawSlot = inputSlot?.slot || inputSlot;
     const resourceId = _safeTrim(rawSlot?.resourceId || rawSlot?.resource?._id || rawSlot?.resource?.id || "");
-    const canonicalServiceId = _safeTrim(expectedServiceId || "");
+    const canonicalServiceId = _extractRelationalId(expectedServiceId || "");
     if (!resourceId || !_looksLikeGuid(canonicalServiceId)) throw new Error("DUAL_RESCHEDULE_SLOT_ID_INVALID");
 
     const pristine = _projectWriterSlotFromAvailability(rawSlot, resourceId, canonicalServiceId);
@@ -553,9 +508,18 @@ async function _assertBookingOwner(cita, traceId) {
 
     const { currentMember } = await import("wix-members-backend");
     const member = await currentMember.getMember({ fieldsets: ["FULL"] }).catch(() => null);
-    const memberEmail = member?.loginEmail ? _safeEmail(member.loginEmail) : null;
+    if (!member) throw new Error("ACCESS_DENIED_DUAL_RESCHEDULE");
+
+    const memberId = _safeTrim(member._id || member.id);
+    const memberEmail = member?.loginEmail ? _safeEmail(member.loginEmail) : "";
+
+    const citaMemberId = _safeTrim(cita?.contactDetails?.contactId || cita?.contactDetails?.memberId || cita?._owner || "");
     const contactEmail = _safeEmail(cita?.contactDetails?.email || "");
-    if (!memberEmail || !contactEmail || memberEmail !== contactEmail) {
+
+    const isMemberMatch = Boolean(memberId && citaMemberId && memberId === citaMemberId);
+    const isEmailMatch = Boolean(memberEmail && contactEmail && memberEmail === contactEmail);
+
+    if (!isMemberMatch && !isEmailMatch) {
         throw new Error("ACCESS_DENIED_DUAL_RESCHEDULE");
     }
 }
@@ -594,23 +558,23 @@ export const rescheduleDualBookings = webMethod(Permissions.SiteMember, async (p
         }
 
         await _assertBookingOwner(citaF1, traceId);
-        const serviceId = _safeTrim(citaF1?.serviceId || "");
+        const serviceId = _extractRelationalId(citaF1?.serviceId || "");
         if (!_looksLikeGuid(serviceId)) {
             return { status: "ERROR", data: null, error: { code: "DUAL_RESCHEDULE_SERVICE_INVALID", message: "The stored serviceId is invalid." } };
         }
 
         const serviceInfo = await getServiceForBookingInternal(serviceId, traceId);
         const serviceConfig = serviceInfo?.status === "SUCCESS" ? serviceInfo.data : null;
-        const linkedServiceId = _safeTrim(serviceConfig?.linkFases || "");
+        const linkedServiceId = _extractRelationalId(serviceConfig?.linkFases || "");
         if (!serviceConfig?.permitirCombinar || !_looksLikeGuid(linkedServiceId)) {
-            return { status: "ERROR", data: null, error: { code: "DUAL_RESCHEDULE_CONFIG_INVALID", message: "Import2 does not define a valid dual service configuration." } };
+            return { status: "ERROR", data: null, error: { code: "DUAL_RESCHEDULE_CONFIG_INVALID", message: "SERVICIOS_RESERVA does not define a valid dual service configuration." } };
         }
 
         const f1DurationMinutes = Number(serviceConfig.tiempoFase1) || 0;
         const f2DurationMinutes = Number(serviceConfig.tiempoFase2) || 0;
         const expectedGapMs = Math.max(0, Number(serviceConfig.tiempoExposicion) || 0) * 60 * 1000;
         if (!f1DurationMinutes || !f2DurationMinutes) {
-            return { status: "ERROR", data: null, error: { code: "DUAL_RESCHEDULE_DURATION_INVALID", message: "Import2 dual phase durations are invalid." } };
+            return { status: "ERROR", data: null, error: { code: "DUAL_RESCHEDULE_DURATION_INVALID", message: "Dual phase durations are invalid." } };
         }
 
         const pristineF1 = await _buildDualRescheduleSlot(citaF1, slotF1Input, serviceId);
@@ -623,18 +587,21 @@ export const rescheduleDualBookings = webMethod(Permissions.SiteMember, async (p
         const newGapMs = newF2Start && newF1End ? newF2Start.getTime() - newF1End.getTime() : NaN;
         const f2DurationMs = newF2End && newF2Start ? newF2End.getTime() - newF2Start.getTime() : NaN;
         if (!newF1Start || !newF1End || !newF2Start || !newF2End || !Number.isFinite(newGapMs) || newGapMs < expectedGapMs) {
-            return { status: "ERROR", data: null, error: { code: "DUAL_GAP_MISMATCH", message: "The new slots must respect the minimum Import2 phase gap." } };
+            return { status: "ERROR", data: null, error: { code: "DUAL_GAP_MISMATCH", message: "The new slots must respect the minimum phase gap." } };
         }
         if (!Number.isFinite(f2DurationMs) || Math.abs(f2DurationMs - (f2DurationMinutes * 60 * 1000)) > 1000) {
-            return { status: "ERROR", data: null, error: { code: "DUAL_DURATION_MISMATCH", message: "The second phase duration must match Import2." } };
+            return { status: "ERROR", data: null, error: { code: "DUAL_DURATION_MISMATCH", message: "The second phase duration must match configuration." } };
         }
+
+        const resIdF1 = _safeTrim(pristineF1.resource?._id || pristineF1.resource?.id || "");
+        const resIdF2 = _safeTrim(pristineF2.resource?._id || pristineF2.resource?.id || "");
 
         const [exactF1, exactF2] = await Promise.all([
             revalidateExactAvailabilitySlot({
                 serviceId,
                 localStartDate: getMadridLocalStringNoZ(newF1Start),
                 localEndDate: getMadridLocalStringNoZ(newF1End),
-                resourceId: pristineF1.resource.id,
+                resourceId: resIdF1,
                 nativeAddonIds: _getNativeAddonIdsForRevalidation(citaF1),
                 traceId,
             }),
@@ -642,7 +609,7 @@ export const rescheduleDualBookings = webMethod(Permissions.SiteMember, async (p
                 serviceId: linkedServiceId,
                 localStartDate: getMadridLocalStringNoZ(newF2Start),
                 localEndDate: getMadridLocalStringNoZ(newF2End),
-                resourceId: pristineF2.resource.id,
+                resourceId: resIdF2,
                 traceId,
             }),
         ]);
@@ -651,8 +618,8 @@ export const rescheduleDualBookings = webMethod(Permissions.SiteMember, async (p
         }
 
         lockKeys.push(
-            _generateSlotKey(serviceId, pristineF1.resource.id, pristineF1.startDate, pristineF1.endDate),
-            _generateSlotKey(linkedServiceId, pristineF2.resource.id, pristineF2.startDate, pristineF2.endDate)
+            _generateSlotKey(serviceId, resIdF1, pristineF1.startDate, pristineF1.endDate),
+            _generateSlotKey(linkedServiceId, resIdF2, pristineF2.startDate, pristineF2.endDate)
         );
         const uniqueKeys = Array.from(new Set(lockKeys)).sort();
         for (const key of uniqueKeys) {
@@ -715,43 +682,43 @@ export const rescheduleDualBookings = webMethod(Permissions.SiteMember, async (p
         }
 
         const revisedF2 = Number(resultF2?.booking?.revision || resultF2?.revision || revisionF2) || revisionF2;
-        const now = new Date();
         const updates = [
             { cita: citaF1, pristine: pristineF1, revision: revisedF1 },
             { cita: citaF2, pristine: pristineF2, revision: revisedF2 },
-        ].map(({ cita, pristine, revision }) => {
-            const { _createdDate, _updatedDate, _owner, ...safeCita } = cita;
+        ];
+
+        for (const { cita, pristine, revision } of updates) {
             const startUtc = getUtcDateFromMadridLocal(pristine.startDate);
             const endUtc = getUtcDateFromMadridLocal(pristine.endDate);
-            return {
-                ...safeCita,
-                startDate: pristine.startDate,
-                endDate: pristine.endDate,
+            const targetResourceId = _safeTrim(pristine.resource?._id || pristine.resource?.id || "");
+            await _updateCitaSafe(cita.bookingId, (item) => ({
+                ...item,
+                startDate: startUtc,
+                endDate: endUtc,
                 startDateLocal: getMadridLocalStringNoZ(startUtc),
                 endDateLocal: getMadridLocalStringNoZ(endUtc),
                 fechaYmdMadrid: getMadridLocalStringNoZ(startUtc).slice(0, 10),
-                resourceId: pristine.resource.id,
+                resourceId: targetResourceId,
                 scheduleId: pristine.scheduleId || null,
                 revision,
-                fechaActualizacion: now,
-            };
-        });
-        await Promise.all(updates.map((item) => wixData.update(CITAS_COLLECTION, item, { suppressAuth: true })));
+            }), traceId, "rescheduleDualBookings");
+        }
 
-        // Invalidate availability caches for both services and dates (best-effort)
         const oldDateF1 = String(citaF1.startDateLocal || citaF1.fechaYmdMadrid || "").slice(0, 10);
         const newDateF1 = getMadridLocalStringNoZ(newF1Start).slice(0, 10);
-        const resourceIdF1 = pristineF1.resource.id;
-        const resourceIdF2 = pristineF2.resource.id;
+        const oldDateF2 = String(citaF2.startDateLocal || citaF2.fechaYmdMadrid || "").slice(0, 10);
+        const newDateF2 = getMadridLocalStringNoZ(newF2Start).slice(0, 10);
+        const resourceIdF1 = resIdF1;
+        const resourceIdF2 = resIdF2;
 
         try {
             await _invalidateCachesInternal(serviceId, oldDateF1, citaF1.resourceId || resourceIdF1, traceId);
             if (newDateF1 && (newDateF1 !== oldDateF1 || citaF1.resourceId !== resourceIdF1)) {
                 await _invalidateCachesInternal(serviceId, newDateF1, resourceIdF1, traceId);
             }
-            await _invalidateCachesInternal(linkedServiceId, oldDateF1, citaF2.resourceId || resourceIdF2, traceId);
-            if (newDateF1 && (newDateF1 !== oldDateF1 || citaF2.resourceId !== resourceIdF2)) {
-                await _invalidateCachesInternal(linkedServiceId, newDateF1, resourceIdF2, traceId);
+            await _invalidateCachesInternal(linkedServiceId, oldDateF2, citaF2.resourceId || resourceIdF2, traceId);
+            if (newDateF2 && (newDateF2 !== oldDateF2 || citaF2.resourceId !== resourceIdF2)) {
+                await _invalidateCachesInternal(linkedServiceId, newDateF2, resourceIdF2, traceId);
             }
         } catch (cacheErr) {
             log.warn("rescheduleDualBookings: Cache invalidation failed (best-effort)", { traceId, error: cacheErr?.message });

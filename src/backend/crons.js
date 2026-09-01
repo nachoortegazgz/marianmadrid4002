@@ -1,10 +1,10 @@
 /*
 =============================================================================
 MODULE: backend/crons.js
-VERSION: marianmadrid4003 (v21.1.0-LTS-remediated-full-purges)
-RESPONSIBILITY: Scheduled background jobs: RAM cache eviction, mutex lock purging,
-            DualSlotCache cleanup, DaysCache cleanup, BookingTransactions purge,
-            Compensations retention, automated Z-Closing, and health monitoring.
+VERSION: marianmadrid4004 (v21.1.2-LTS-remediated-joblocks-safepurge)
+RESPONSIBILITY: Scheduled background jobs with distributed execution mutex locks,
+            safe multi-page purging with failed item accounting, RAM cache eviction,
+            automated Z-Closing, and health monitoring.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
@@ -17,6 +17,7 @@ import {
     makeTraceId,
     withTimeout,
     _addDaysYMD,
+    _normalizeIdPart,
 } from "public/mmUtils";
 import {
     COLLECTIONS,
@@ -46,10 +47,29 @@ const COMPENSATION_BATCH_SIZE = Math.max(1, Math.min(FISCAL_RECOVERY_BATCH_SIZE,
 const MAX_COMPENSATION_RETRIES = Number(CONCURRENCY.MAX_COMPENSATION_RETRIES) || 3;
 const COMPENSATION_LOCK_TTL_MS = Number(CONCURRENCY.MUTEX_TTL_MS) || 120000;
 const COMPLETED_COMPENSATION_RETENTION_DAYS = 30;
+const CRON_JOB_MUTEX_TTL_MS = 60000;
 const queryExtendedBookingsElevated = elevate(extendedBookings.queryExtendedBookings);
+
+async function _withJobMutex(jobName, traceId, ttlMs, executeFn) {
+    const safeJobName = _normalizeIdPart(jobName, 40);
+    const lockKey = `cron_job_${safeJobName}`;
+    const lockOwner = `${traceId}:${safeJobName}`;
+    const lock = await _lockSlotKeyOrFail(lockKey, lockOwner, ttlMs || CRON_JOB_MUTEX_TTL_MS);
+    if (!lock?.ok) {
+        log.warn(`[CRON] Job ${safeJobName} skipped: already running on another instance`, { traceId });
+        return { status: "SKIPPED", data: { reason: "CONCURRENT_JOB_RUNNING" }, error: null };
+    }
+    try {
+        return await executeFn();
+    } finally {
+        await _unlockSlotKey(lockKey, lockOwner).catch(() => {});
+    }
+}
 
 async function _removeByQuery(collectionName, queryBuilder, traceId, label) {
     let totalRemoved = 0;
+    let totalFailed = 0;
+    const failedIds = [];
     let hasMore = true;
     let pageCount = 0;
     const maxPages = DELETE_MAX_PAGES;
@@ -66,25 +86,44 @@ async function _removeByQuery(collectionName, queryBuilder, traceId, label) {
             const items = res?.items || [];
             if (!items.length) break;
 
+            let iterationRemoved = 0;
             for (const item of items) {
-                await withTimeout(
-                    wixData.remove(collectionName, item._id, { suppressAuth: true }),
-                    JOB_TIMEOUT_MS,
-                    `${label}-remove`
-                );
-                totalRemoved++;
+                try {
+                    await withTimeout(
+                        wixData.remove(collectionName, item._id, { suppressAuth: true }),
+                        JOB_TIMEOUT_MS,
+                        `${label}-remove`
+                    );
+                    totalRemoved++;
+                    iterationRemoved++;
+                } catch (removeErr) {
+                    totalFailed++;
+                    if (failedIds.length < 50) failedIds.push(item._id);
+                    log.warn(`[CRON] ${label} remove item failed: ${item._id}`, { error: removeErr?.message, traceId });
+                }
             }
+
+            if (iterationRemoved === 0) {
+                log.error(`[CRON] ${label} loop guard abort: 0 items deleted in page ${pageCount}`, { pageCount, traceId, totalFailed });
+                break;
+            }
+
             hasMore = items.length === DELETE_BATCH_SIZE;
         }
 
-        if (pageCount >= maxPages && hasMore) {
-            log.warn(`[CRON] ${label} reached max pages limit, remaining items will be processed in next execution`, {
-                totalRemoved,
-                pageCount,
-                traceId,
-            });
-        }
-        return { status: "SUCCESS", data: { count: totalRemoved, pages: pageCount }, error: null };
+        const remainingPossible = hasMore && pageCount >= maxPages;
+        return {
+            status: totalFailed > 0 ? "PARTIAL" : "SUCCESS",
+            data: {
+                count: totalRemoved,
+                removed: totalRemoved,
+                failed: totalFailed,
+                failedIds,
+                pages: pageCount,
+                remainingPossible,
+            },
+            error: null,
+        };
     } catch (error) {
         log.error(`[CRON] ${label} failed`, { error: error?.message || String(error), traceId });
         return { status: "ERROR", data: null, error: { code: "CRON_FAIL", message: error?.message || String(error) } };
@@ -176,7 +215,7 @@ async function _processBookingCompensation(item, traceId) {
             ...(terminal ? { fechaFallo: now } : {}),
         });
         log.error("[CRON] Booking compensation attempt failed", {
-            bookingId,
+            bookingId: _normalizeIdPart(bookingId, 20),
             traceId,
             attempts,
             terminal,
@@ -186,7 +225,7 @@ async function _processBookingCompensation(item, traceId) {
     } finally {
         await _unlockSlotKey(lockKey, lockOwnerId).catch((error) => {
             log.error("[CRON] Booking compensation unlock failed", {
-                bookingId,
+                bookingId: _normalizeIdPart(bookingId, 20),
                 traceId,
                 message: error?.message,
             });
@@ -196,51 +235,53 @@ async function _processBookingCompensation(item, traceId) {
 
 export async function runPendingCompensationsJob() {
     const traceId = makeTraceId("cron-compensations");
-    try {
-        const pending = await withTimeout(
-            wixData.query(COLLECTIONS.COMPENSATIONS)
-                .eq("status", "PENDING")
-                .ascending("createdAt")
-                .limit(COMPENSATION_BATCH_SIZE)
-                .find({ suppressAuth: true, consistentRead: true }),
-            JOB_TIMEOUT_MS,
-            "cron-pendingCompensations"
-        );
+    return await _withJobMutex("runPendingCompensationsJob", traceId, JOB_TIMEOUT_MS, async () => {
+        try {
+            const pending = await withTimeout(
+                wixData.query(COLLECTIONS.COMPENSATIONS)
+                    .eq("status", "PENDING")
+                    .ascending("createdAt")
+                    .limit(COMPENSATION_BATCH_SIZE)
+                    .find({ suppressAuth: true, consistentRead: true }),
+                JOB_TIMEOUT_MS,
+                "cron-pendingCompensations"
+            );
 
-        const bookingResult = { completed: 0, failed: 0, skipped: 0 };
-        const bookingItems = (pending?.items || []).filter((item) => !item?.kind && item?.bookingId);
-        for (const item of bookingItems) {
-            const result = await _processBookingCompensation(item, traceId);
-            bookingResult.completed += result.completed;
-            bookingResult.failed += result.failed;
-            bookingResult.skipped += result.skipped;
+            const bookingResult = { completed: 0, failed: 0, skipped: 0 };
+            const bookingItems = (pending?.items || []).filter((item) => !item?.kind && item?.bookingId);
+            for (const item of bookingItems) {
+                const result = await _processBookingCompensation(item, traceId);
+                bookingResult.completed += result.completed;
+                bookingResult.failed += result.failed;
+                bookingResult.skipped += result.skipped;
+            }
+
+            const fiscalResult = await processPendingFiscalRecoveries({
+                traceId,
+                limit: FISCAL_RECOVERY_BATCH_SIZE,
+            });
+
+            return {
+                status: fiscalResult?.status === "SUCCESS" ? "SUCCESS" : "PARTIAL",
+                data: {
+                    scanned: pending?.items?.length || 0,
+                    bookingCompensations: bookingResult,
+                    fiscalRecoveries: fiscalResult?.data || null,
+                },
+                error: fiscalResult?.status === "SUCCESS" ? null : fiscalResult?.error || null,
+            };
+        } catch (error) {
+            log.error("[CRON] Pending compensations job failed", {
+                traceId,
+                message: error?.message || String(error),
+            });
+            return {
+                status: "ERROR",
+                data: null,
+                error: { code: "PENDING_COMPENSATIONS_CRON_FAIL", message: error?.message || String(error) },
+            };
         }
-
-        const fiscalResult = await processPendingFiscalRecoveries({
-            traceId,
-            limit: FISCAL_RECOVERY_BATCH_SIZE,
-        });
-
-        return {
-            status: fiscalResult?.status === "SUCCESS" ? "SUCCESS" : "PARTIAL",
-            data: {
-                scanned: pending?.items?.length || 0,
-                bookingCompensations: bookingResult,
-                fiscalRecoveries: fiscalResult?.data || null,
-            },
-            error: fiscalResult?.status === "SUCCESS" ? null : fiscalResult?.error || null,
-        };
-    } catch (error) {
-        log.error("[CRON] Pending compensations job failed", {
-            traceId,
-            message: error?.message || String(error),
-        });
-        return {
-            status: "ERROR",
-            data: null,
-            error: { code: "PENDING_COMPENSATIONS_CRON_FAIL", message: error?.message || String(error) },
-        };
-    }
+    });
 }
 
 export async function cleanExpiredLocks() {
@@ -346,77 +387,85 @@ export async function purgeRamCachesJob() {
 
 export async function processFiscalRecoveryQueue() {
     const traceId = makeTraceId("cron-fiscal-recovery");
-    try {
-        return await processPendingFiscalRecoveries({ traceId, limit: FISCAL_RECOVERY_BATCH_SIZE });
-    } catch (error) {
-        log.error("[CRON] Fiscal recovery queue failed", { error: error?.message || String(error), traceId });
-        return { status: "ERROR", data: null, error: { code: "FISCAL_RECOVERY_CRON_FAIL", message: error?.message || String(error) } };
-    }
+    return await _withJobMutex("processFiscalRecoveryQueue", traceId, JOB_TIMEOUT_MS, async () => {
+        try {
+            return await processPendingFiscalRecoveries({ traceId, limit: FISCAL_RECOVERY_BATCH_SIZE });
+        } catch (error) {
+            log.error("[CRON] Fiscal recovery queue failed", { error: error?.message || String(error), traceId });
+            return { status: "ERROR", data: null, error: { code: "FISCAL_RECOVERY_CRON_FAIL", message: error?.message || String(error) } };
+        }
+    });
 }
 
 export async function processBookingsServiceSyncJob() {
     const traceId = makeTraceId("cron-bookings-service-sync");
-    try {
-        return await processBookingsServiceSyncQueue({ traceId });
-    } catch (_) {
-        log.error("[CRON] Bookings service sync job failed", { traceId, errorCode: "BOOKINGS_SERVICE_SYNC_JOB_FAILED" });
-        return { status: "ERROR", data: null, error: { code: "BOOKINGS_SERVICE_SYNC_JOB_FAILED", message: "Bookings service synchronization failed." } };
-    }
+    return await _withJobMutex("processBookingsServiceSyncJob", traceId, JOB_TIMEOUT_MS, async () => {
+        try {
+            return await processBookingsServiceSyncQueue({ traceId });
+        } catch (_) {
+            log.error("[CRON] Bookings service sync job failed", { traceId, errorCode: "BOOKINGS_SERVICE_SYNC_JOB_FAILED" });
+            return { status: "ERROR", data: null, error: { code: "BOOKINGS_SERVICE_SYNC_JOB_FAILED", message: "Bookings service synchronization failed." } };
+        }
+    });
 }
 
 export async function prepareManagerPackagesJob() {
     const traceId = makeTraceId("cron-manager-packages");
-    try {
-        return await withTimeout(
-            prepareScheduledManagerPackages({ traceId }),
-            JOB_TIMEOUT_MS,
-            "cron-prepareManagerPackages"
-        );
-    } catch (error) {
-        log.error("[CRON] Scheduled manager-package preparation failed", {
-            traceId,
-            message: error?.message || String(error),
-        });
-        return {
-            status: "ERROR",
-            data: null,
-            error: { code: "MANAGER_PACKAGE_CRON_FAIL", message: "Document preparation failed." },
-        };
-    }
+    return await _withJobMutex("prepareManagerPackagesJob", traceId, JOB_TIMEOUT_MS, async () => {
+        try {
+            return await withTimeout(
+                prepareScheduledManagerPackages({ traceId }),
+                JOB_TIMEOUT_MS,
+                "cron-prepareManagerPackages"
+            );
+        } catch (error) {
+            log.error("[CRON] Scheduled manager-package preparation failed", {
+                traceId,
+                message: error?.message || String(error),
+            });
+            return {
+                status: "ERROR",
+                data: null,
+                error: { code: "MANAGER_PACKAGE_CRON_FAIL", message: "Document preparation failed." },
+            };
+        }
+    });
 }
 
 export async function verifyNightlyZClosing() {
     const traceId = makeTraceId("cron-zclosing");
-    try {
-        const tz = SDK_CONFIG?.TZ || "Europe/Madrid";
-        const nowMadridYmd = new Date().toLocaleDateString("sv-SE", { timeZone: tz });
-        const diaKey = _addDaysYMD(nowMadridYmd, -1);
+    return await _withJobMutex("verifyNightlyZClosing", traceId, JOB_TIMEOUT_MS, async () => {
+        try {
+            const tz = SDK_CONFIG?.TZ || "Europe/Madrid";
+            const nowMadridYmd = new Date().toLocaleDateString("sv-SE", { timeZone: tz });
+            const diaKey = _addDaysYMD(nowMadridYmd, -1);
 
-        if (!diaKey) {
-            throw new Error("No se pudo calcular la fecha previa para el cierre Z nocturno.");
+            if (!diaKey) {
+                throw new Error("No se pudo calcular la fecha previa para el cierre Z nocturno.");
+            }
+
+            const existing = await withTimeout(
+                wixData.query(COLLECTIONS.HISTORICO_CIERRES_Z).eq("diaKey", diaKey).limit(1).find({ suppressAuth: true, consistentRead: true }),
+                JOB_TIMEOUT_MS,
+                "cron-checkZClosing"
+            );
+
+            if (existing.items?.length > 0) {
+                return { status: "SUCCESS", data: { idempotent: true, diaKey }, error: null };
+            }
+
+            const integrity = await _verifyIntegrityInternal(diaKey, { traceId });
+            if (!integrity || !integrity.integrityOk) {
+                log.error("[CRON] Integrity violation, Z-Closing aborted", { diaKey, inconsistenciesCount: integrity?.inconsistencies?.length, traceId });
+                return { status: "ERROR", data: null, error: { code: "INTEGRITY_VIOLATION", message: "Integrity violation" } };
+            }
+
+            return await _registerZClosingInternal(diaKey, { traceId, autoCron: true });
+        } catch (error) {
+            log.error("[CRON] Auto Z-Closing error", { error: error?.message || String(error), traceId });
+            return { status: "ERROR", data: null, error: { code: "CRON_FAIL", message: error?.message || String(error) } };
         }
-
-        const existing = await withTimeout(
-            wixData.query(COLLECTIONS.HISTORICO_CIERRES_Z).eq("diaKey", diaKey).limit(1).find({ suppressAuth: true, consistentRead: true }),
-            JOB_TIMEOUT_MS,
-            "cron-checkZClosing"
-        );
-
-        if (existing.items?.length > 0) {
-            return { status: "SUCCESS", data: { idempotent: true, diaKey }, error: null };
-        }
-
-        const integrity = await _verifyIntegrityInternal(diaKey, { traceId });
-        if (!integrity || !integrity.integrityOk) {
-            log.error("[CRON] Integrity violation, Z-Closing aborted", { diaKey, inconsistencies: integrity?.inconsistencies, traceId });
-            return { status: "ERROR", data: null, error: { code: "INTEGRITY_VIOLATION", message: "Integrity violation" } };
-        }
-
-        return await _registerZClosingInternal(diaKey, { traceId, autoCron: true });
-    } catch (error) {
-        log.error("[CRON] Auto Z-Closing error", { error: error?.message || String(error), traceId });
-        return { status: "ERROR", data: null, error: { code: "CRON_FAIL", message: error?.message || String(error) } };
-    }
+    });
 }
 
 export async function cleanAuditLogs() {

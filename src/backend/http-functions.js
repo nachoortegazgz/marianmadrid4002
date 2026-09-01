@@ -1,9 +1,9 @@
 /*
 =============================================================================
 MODULE: backend/http-functions.js
-VERSION: marianmadrid4003 (v21.1.0-LTS-remediated-distributed-nonce)
+VERSION: marianmadrid4004 (v21.1.2-LTS-remediated-phase3-bounded-endpoints)
 RESPONSIBILITY: Public HTTP REST endpoints for external integrations (M365 / Power Automate)
-            with distributed multi-instance HMAC anti-replay protection.
+            with distributed multi-instance HMAC anti-replay protection and bounded query parameters.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
@@ -312,8 +312,13 @@ export async function get_getMovements(request) {
             });
         }
 
+        const limitParam = Math.min(Math.max(Number(request?.query?.limit) || 100, 1), 250);
         const res = await withTimeout(
-            wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA).eq("diaKey", date).ascending("fechaCreacion").limit(1000).find({ suppressAuth: true, consistentRead: true }),
+            wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA)
+                .eq("diaKey", date)
+                .ascending("fechaCreacion")
+                .limit(limitParam)
+                .find({ suppressAuth: true, consistentRead: true }),
             CMS_TIMEOUT_MS,
             "queryMovimientos"
         );
@@ -321,7 +326,7 @@ export async function get_getMovements(request) {
         const items = (res?.items || []).map(_toExternalMovement);
         await _logSyncEvent("get_getMovements", "SUCCESS", items.length, traceId);
         return ok({
-            body: successResponse(items, { traceId, date, count: items.length }),
+            body: successResponse(items, { traceId, date, count: items.length, limit: limitParam, hasMore: Boolean(res?.hasNext()) }),
             headers: _responseHeaders(request, traceId),
         });
     } catch (error) {
@@ -407,15 +412,20 @@ export async function get_getSchedule(request) {
             });
         }
 
+        const limitParam = Math.min(Math.max(Number(request?.query?.limit) || 100, 1), 250);
         const res = await withTimeout(
-            wixData.query(COLLECTIONS.REGISTRO_HORARIO).eq("diaKey", date).ascending("fechaHora").limit(1000).find({ suppressAuth: true, consistentRead: true }),
+            wixData.query(COLLECTIONS.REGISTRO_HORARIO)
+                .eq("diaKey", date)
+                .ascending("fechaHora")
+                .limit(limitParam)
+                .find({ suppressAuth: true, consistentRead: true }),
             CMS_TIMEOUT_MS,
             "queryHorario"
         );
         const items = (res?.items || []).map(_toExternalScheduleItem);
         await _logSyncEvent("get_getSchedule", "SUCCESS", items.length, traceId);
         return ok({
-            body: successResponse(items, { traceId, date, count: items.length }),
+            body: successResponse(items, { traceId, date, count: items.length, limit: limitParam, hasMore: Boolean(res?.hasNext()) }),
             headers: _responseHeaders(request, traceId),
         });
     } catch (error) {

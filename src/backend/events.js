@@ -1,23 +1,12 @@
-/**
- * =============================================================================
- * MODULE: backend/events.js
- * VERSION: v20.0.0-universal-ecom-settlement
- * RESPONSIBILITY: Server-to-server native webhooks for Wix Bookings V2 and
- * Wix eCommerce V2. Universal payment settlement for bookings, store products,
- * and mixed orders into the immutable cashbox ledger.
- * STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
- * HISTORIAL:
- * - v20.0.0-universal-ecom-settlement: Fixes P0 flaw for pure Wix Stores orders;
- *   ensures universal ledger settlement under ORDER-${orderId}, handles mixed orders,
- *   preserves inventory mirroring, and standardizes refund traceability.
- * - v19.6.3-prioritized-reliability-refactor: Removes duplicated catalog and slot paths, restores Codegem fixes, and hardens persistence.
- * - v19.5.3-fiscal-ordering-hardening: Holds CitasF2 in PENDING_LEDGER until the online payment ledger is durable or queued for recovery.
- * - v19.5.1-ecom-events-ssot: Uses SSOT webhook timing and removes the deprecated paid-event alias.
- * - v19.4.4: Handles each refund by stable refund ID, queues fiscal failures, and distinguishes partial/full refund payment state.
- * - v19.3.0-inventory-order-mirror: Mirrors paid Wix Stores orders without duplicating native stock decrement.
- * - v19.2.0-state-ssot-hardened: Canonical CitasF2 state writes and durable fiscal recovery queue.
- * =============================================================================
- */
+/*
+=============================================================================
+MODULE: backend/events.js
+VERSION: marianmadrid4003 (v21.1.2-LTS-remediated-phase3-exact-queries)
+RESPONSIBILITY: Server-to-server native webhooks for Wix Bookings V2 and
+            Wix eCommerce V2 with exact-indexed queries and bounded execution.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
 
 import wixData from "wix-data";
 import {
@@ -25,6 +14,7 @@ import {
     _executeWithRetry,
     _normalizeIdPart,
     withTimeout,
+    _roundMoney,
 } from "public/mmUtils";
 import {
     COLLECTIONS,
@@ -36,7 +26,7 @@ import {
     CITA_FIELDS,
     SDK_CONFIG,
 } from "backend/internalConfig";
-import { logger, normalizeError } from "backend/booking/bookingCore";
+import { logger, normalizeError, _updateCitaSafe } from "backend/booking/bookingCore";
 import { registerBookingPayment, queueFiscalRecovery } from "backend/cajas.web";
 import {
     recordOnlineInventoryOrderInternal,
@@ -82,54 +72,27 @@ async function _logAuditEvent(tipoEvento, level, message, data = {}, traceId, en
 }
 
 async function _updateCitaEstado(bookingId, nuevoEstado, traceId) {
-    if (!bookingId || bookingId === "unknown") return;
-    try {
-        const citaRes = await withTimeout(
-            wixData.query(COLLECTIONS.CITAS).eq("bookingId", bookingId).limit(1).find({ suppressAuth: true }),
-            API_TIMEOUT_MS,
-            "queryCitaEstado"
-        );
-        if (citaRes.items?.length > 0) {
-            const cita = citaRes.items[0];
-            if (String(cita[CITA_FIELDS.STATUS] || "").toUpperCase() !== String(nuevoEstado || "").toUpperCase()) {
-                const { _createdDate, _updatedDate, _owner, ...safeCita } = cita;
-                const updatedCita = {
-                    ...safeCita,
-                    [CITA_FIELDS.STATUS]: String(nuevoEstado || ESTADO_CITA.CONFIRMED).toUpperCase(),
-                    fechaActualizacion: new Date(),
-                };
-                await withTimeout(
-                    wixData.update(COLLECTIONS.CITAS, updatedCita, { suppressAuth: true }),
-                    API_TIMEOUT_MS,
-                    "updateCitaEstado"
-                );
-            }
+    await _updateCitaSafe(bookingId, (cita) => {
+        if (String(cita[CITA_FIELDS.STATUS] || "").toUpperCase() === String(nuevoEstado || "").toUpperCase()) {
+            return null;
         }
-    } catch (err) {
-        log.warn("Failed to update CITAS state", { bookingId, error: err?.message, traceId });
-    }
+        return {
+            ...cita,
+            [CITA_FIELDS.STATUS]: String(nuevoEstado || ESTADO_CITA.CONFIRMED).toUpperCase(),
+        };
+    }, traceId, "events_updateCitaEstado");
 }
 
 async function _markCitasRefundedByBookingIds(bookingIds, orderId, refundId, fullyRefunded, traceId) {
     const ids = Array.isArray(bookingIds) ? bookingIds.map(String).filter(Boolean) : [];
     for (const bookingId of ids) {
-        try {
-            const res = await withTimeout(
-                wixData.query(COLLECTIONS.CITAS).eq("bookingId", bookingId).limit(1).find({ suppressAuth: true }),
-                API_TIMEOUT_MS,
-                "queryCitaForRefund"
-            );
-            const cita = res?.items?.[0];
-            if (!cita) continue;
+        await _updateCitaSafe(bookingId, (cita) => {
             const meta = cita.meta || {};
-            const { _createdDate, _updatedDate, _owner, ...safeCita } = cita;
             const paymentState = fullyRefunded ? ESTADO_PAGO.REFUNDED : ESTADO_PAGO.PARTIALLY_REFUNDED;
-            const updated = {
-                ...safeCita,
-                ...(fullyRefunded ? {
-                    [CITA_FIELDS.STATUS]: ESTADO_CITA.REFUNDED } : {}),
+            return {
+                ...cita,
+                ...(fullyRefunded ? { [CITA_FIELDS.STATUS]: ESTADO_CITA.REFUNDED } : {}),
                 [CITA_FIELDS.STATUS_PAGO]: paymentState,
-                fechaActualizacion: new Date(),
                 meta: {
                     ...meta,
                     [CITA_FIELDS.STATUS_PAGO]: paymentState,
@@ -138,49 +101,22 @@ async function _markCitasRefundedByBookingIds(bookingIds, orderId, refundId, ful
                     fechaReembolso: new Date(),
                 },
             };
-            await withTimeout(
-                wixData.update(COLLECTIONS.CITAS, updated, { suppressAuth: true }),
-                API_TIMEOUT_MS,
-                "updateCitaRefund"
-            );
-        } catch (e) {
-            log.warn("Failed to mark cita as refunded", { bookingId, traceId, error: e?.message });
-        }
+        }, traceId, "events_markRefunded");
     }
 }
 
 async function _markCitasPaidByBookingIds(bookingIds, orderId, traceId) {
     const ids = Array.from(new Set(Array.isArray(bookingIds) ? bookingIds.map(String).filter(Boolean) : []));
-    if (!ids.length) return;
-
-    let citas = [];
-    try {
-        const res = await withTimeout(
-            wixData.query(COLLECTIONS.CITAS).in("bookingId", ids).limit(1000).find({ suppressAuth: true }),
-            API_TIMEOUT_MS,
-            "queryCitasForPaid"
-        );
-        citas = res?.items || [];
-    } catch (error) {
-        log.warn("Failed to query CITAS for payment update", { bookingIds: ids, traceId, error: error?.message });
-        return;
-    }
-
-    const citasByBookingId = new Map(citas.map((cita) => [String(cita?.bookingId || ""), cita]));
     for (const bookingId of ids) {
-        const cita = citasByBookingId.get(bookingId);
-        if (!cita) continue;
-        try {
+        await _updateCitaSafe(bookingId, (cita) => {
             const meta = cita.meta || {};
             const alreadyPaid = String(meta.statusPago || cita.statusPago || "").toUpperCase() === ESTADO_PAGO.PAID;
-            if (alreadyPaid) continue;
+            if (alreadyPaid) return null;
 
-            const { _createdDate, _updatedDate, _owner, ...safeCita } = cita;
-            const updated = {
-                ...safeCita,
+            return {
+                ...cita,
                 [CITA_FIELDS.STATUS]: ESTADO_CITA.CONFIRMED,
                 [CITA_FIELDS.STATUS_PAGO]: ESTADO_PAGO.PAID,
-                fechaActualizacion: new Date(),
                 meta: {
                     ...meta,
                     [CITA_FIELDS.STATUS_PAGO]: ESTADO_PAGO.PAID,
@@ -188,37 +124,21 @@ async function _markCitasPaidByBookingIds(bookingIds, orderId, traceId) {
                     fechaConfirmacionPago: new Date(),
                 },
             };
-            await withTimeout(
-                wixData.update(COLLECTIONS.CITAS, updated, { suppressAuth: true }),
-                API_TIMEOUT_MS,
-                "updateCitaPaid"
-            );
-        } catch (error) {
-            log.warn("Failed to mark cita as PAID", { bookingId, traceId, error: error?.message });
-        }
+        }, traceId, "events_markPaid");
     }
 }
 
 async function _markCitasPendingLedgerByBookingIds(bookingIds, orderId, traceId) {
     const ids = Array.isArray(bookingIds) ? bookingIds.map(String).filter(Boolean) : [];
     for (const bookingId of ids) {
-        try {
-            const res = await withTimeout(
-                wixData.query(COLLECTIONS.CITAS).eq("bookingId", bookingId).limit(1).find({ suppressAuth: true }),
-                API_TIMEOUT_MS,
-                "queryCitaForPendingLedger"
-            );
-            const cita = res?.items?.[0];
-            if (!cita) continue;
+        await _updateCitaSafe(bookingId, (cita) => {
             const meta = cita.meta || {};
             const currentPaymentState = String(meta.statusPago || cita.statusPago || "").toUpperCase();
-            if (currentPaymentState === ESTADO_PAGO.PAID) continue;
+            if (currentPaymentState === ESTADO_PAGO.PAID) return null;
 
-            const { _createdDate, _updatedDate, _owner, ...safeCita } = cita;
-            const updated = {
-                ...safeCita,
+            return {
+                ...cita,
                 [CITA_FIELDS.STATUS_PAGO]: ESTADO_PAGO.PENDING_LEDGER,
-                fechaActualizacion: new Date(),
                 meta: {
                     ...meta,
                     [CITA_FIELDS.STATUS_PAGO]: ESTADO_PAGO.PENDING_LEDGER,
@@ -226,14 +146,7 @@ async function _markCitasPendingLedgerByBookingIds(bookingIds, orderId, traceId)
                     fechaPagoRecibido: new Date(),
                 },
             };
-            await withTimeout(
-                wixData.update(COLLECTIONS.CITAS, updated, { suppressAuth: true }),
-                API_TIMEOUT_MS,
-                "updateCitaPendingLedger"
-            );
-        } catch (error) {
-            log.warn("Failed to mark cita as PENDING_LEDGER", { bookingId, traceId, error: error?.message });
-        }
+        }, traceId, "events_markPendingLedger");
     }
 }
 
@@ -277,7 +190,6 @@ export async function wixEcom_onOrderPaymentStatusUpdated(event) {
 
         const lineItems = Array.isArray(order.lineItems) ? order.lineItems : [];
 
-        // 1. Mirror inventory for physical items (safe, best-effort)
         await recordOnlineInventoryOrderInternal(order, traceId).catch((inventoryError) => {
             log.error("Online inventory mirror failed", {
                 orderId,
@@ -286,13 +198,11 @@ export async function wixEcom_onOrderPaymentStatusUpdated(event) {
             });
         });
 
-        // 2. Extract linked bookings
         const bookingsAppId = APP_IDS.BOOKINGS;
         const bookingLineItems = lineItems.filter((item) => item?.catalogReference?.appId === bookingsAppId);
         const bookingIds = bookingLineItems.map((item) => String(item?.catalogReference?.catalogItemId || "").trim()).filter(Boolean);
         const linkedBookingIds = bookingIds.join(",");
 
-        // 3. Consolidated amount calculation
         const orderTotal = Number(order?.priceSummary?.total?.amount ?? order?.totals?.total?.amount ?? 0) || 0;
         const lineItemsTotal = lineItems.reduce((sum, item) => {
             const itemPrice = Number(item?.price?.amount ?? item?.price ?? item?.totalPrice?.amount ?? 0) || 0;
@@ -301,9 +211,8 @@ export async function wixEcom_onOrderPaymentStatusUpdated(event) {
         const finalLedgerAmount = orderTotal > 0 ? orderTotal : lineItemsTotal;
         const transactionId = `ORDER-${orderId}`;
 
-        // 4. Preflight idempotency check on ledger
         const existingLedgerRes = await withTimeout(
-            wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA).eq("transactionId", transactionId).limit(1).find({ suppressAuth: true }),
+            wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA).eq("transactionId", transactionId).limit(1).find({ suppressAuth: true, consistentRead: true }),
             API_TIMEOUT_MS,
             "checkExistingLedgerPreflight"
         ).catch(() => ({ items: [] }));
@@ -317,7 +226,6 @@ export async function wixEcom_onOrderPaymentStatusUpdated(event) {
             return { status: "OK" };
         }
 
-        // 5. Put citations into PENDING_LEDGER before ledger write
         if (bookingIds.length) {
             await _executeWithRetry(async () => {
                 await _markCitasPendingLedgerByBookingIds(bookingIds, orderId, traceId);
@@ -333,12 +241,10 @@ export async function wixEcom_onOrderPaymentStatusUpdated(event) {
             return { status: "OK" };
         }
 
-        // 6. Descriptive concept based on order composition
         const orderConcept = bookingIds.length > 0 ?
             (lineItems.length > bookingIds.length ? `Pedido Mixto Cita + Tienda ${orderId}` : `Reserva Online ${orderId}`) :
             `Venta Online Tienda ${orderId}`;
 
-        // 7. Universal ledger settlement in movimientoCaja
         const ledgerRes = await registerBookingPayment(
             linkedBookingIds || null,
             finalLedgerAmount,
@@ -347,7 +253,7 @@ export async function wixEcom_onOrderPaymentStatusUpdated(event) {
                 resourceId: "online",
                 traceId,
                 transactionId,
-                orderId,
+                orderId: orderId,
                 origen: "WIX_ECOM_PAYMENT_WEBHOOK",
                 tipoMovimiento: TIPO_MOVIMIENTO.VENTA_ONLINE,
             }
@@ -362,7 +268,6 @@ export async function wixEcom_onOrderPaymentStatusUpdated(event) {
             return { status: "OK" };
         }
 
-        // 8. Queue fiscal recovery on failure
         await queueFiscalRecovery({
             bookingIds: linkedBookingIds,
             amount: finalLedgerAmount,
@@ -380,7 +285,8 @@ export async function wixEcom_onOrderPaymentStatusUpdated(event) {
         await _logAuditEvent(
             "LEDGER_REGISTRATION_FAILED",
             "ERROR",
-            `Ledger registration queued for order ${orderId}`, { orderId, bookingIds, ledgerError: ledgerRes?.error || "Unknown error", traceId },
+            `Ledger registration queued for order ${orderId}`,
+            { orderId, bookingIds, ledgerError: ledgerRes?.error || "Unknown error", traceId },
             traceId,
             orderId
         );
@@ -391,7 +297,8 @@ export async function wixEcom_onOrderPaymentStatusUpdated(event) {
         await _logAuditEvent(
             "WEBHOOK_CRITICAL_ERROR",
             "ERROR",
-            `Critical error in webhook: ${normalized.message}`, { error: normalized.message, traceId },
+            `Critical error in webhook: ${normalized.message}`,
+            { error: normalized.message, traceId },
             traceId
         );
         return { status: "OK" };
@@ -416,7 +323,8 @@ export async function wixEcom_onOrderRefunded(event) {
             await _logAuditEvent(
                 "REFUND_ID_MISSING",
                 "ERROR",
-                `Refund without stable identifier for order ${orderId}`, { orderId, traceId },
+                `Refund without stable identifier for order ${orderId}`,
+                { orderId, traceId },
                 traceId,
                 orderId
             );
@@ -426,7 +334,7 @@ export async function wixEcom_onOrderRefunded(event) {
         const transactionId = `REFUND-${orderId}-${refundId}`;
         const originalTransactionId = `ORDER-${orderId}`;
         const originalMovementRes = await withTimeout(
-            wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA).eq("transactionId", originalTransactionId).limit(1).find({ suppressAuth: true }),
+            wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA).eq("transactionId", originalTransactionId).limit(1).find({ suppressAuth: true, consistentRead: true }),
             API_TIMEOUT_MS,
             "queryOriginalMovement"
         ).catch(() => ({ items: [] }));
@@ -451,7 +359,8 @@ export async function wixEcom_onOrderRefunded(event) {
             await _logAuditEvent(
                 "REFUND_WAITING_FOR_ORIGINAL_LEDGER",
                 "ERROR",
-                `Refund queued before original ledger for order ${orderId}`, { orderId, refundId, traceId },
+                `Refund queued before original ledger for order ${orderId}`,
+                { orderId, refundId, traceId },
                 traceId,
                 orderId
             );
@@ -475,7 +384,8 @@ export async function wixEcom_onOrderRefunded(event) {
                 await _logAuditEvent(
                     "REFUND_INVENTORY_TRACE_SKIPPED",
                     "WARN",
-                    `Inventory trace skipped for refund ${refundId}`, { orderId, refundId, reason: inventoryRefund.reason, traceId },
+                    `Inventory trace skipped for refund ${refundId}`,
+                    { orderId, refundId, reason: inventoryRefund.reason, traceId },
                     traceId,
                     orderId
                 );
@@ -484,7 +394,8 @@ export async function wixEcom_onOrderRefunded(event) {
             await _logAuditEvent(
                 "REFUND_INVENTORY_TRACE_FAILED",
                 "ERROR",
-                `Inventory trace failed for refund ${refundId}`, { orderId, refundId, error: inventoryRefundError?.message || String(inventoryRefundError), traceId },
+                `Inventory trace failed for refund ${refundId}`,
+                { orderId, refundId, error: inventoryRefundError?.message || String(inventoryRefundError), traceId },
                 traceId,
                 orderId
             );
@@ -505,7 +416,9 @@ export async function wixEcom_onOrderRefunded(event) {
             }
         );
 
-        if (ledgerRes?.status !== "SUCCESS") {
+        if (ledgerRes?.status === "SUCCESS") {
+            await _markCitasRefundedByBookingIds(linkedBookingIds, orderId, refundId, false, traceId);
+        } else {
             await queueFiscalRecovery({
                 bookingIds: linkedBookingIds.join(","),
                 amount: -refundAmount,
@@ -523,7 +436,8 @@ export async function wixEcom_onOrderRefunded(event) {
             await _logAuditEvent(
                 "REFUND_LEDGER_REGISTRATION_FAILED",
                 "ERROR",
-                `Refund ledger queued for order ${orderId}`, { orderId, refundId, traceId },
+                `Refund ledger queued for order ${orderId}`,
+                { orderId, refundId, traceId },
                 traceId,
                 orderId
             );
@@ -531,7 +445,11 @@ export async function wixEcom_onOrderRefunded(event) {
         }
 
         const refundsRes = await withTimeout(
-            wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA).startsWith("transactionId", `REFUND-${orderId}-`).limit(1000).find({ suppressAuth: true }),
+            wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA)
+                .eq("orderId", orderId)
+                .eq("tipoMovimiento", TIPO_MOVIMIENTO.REEMBOLSO)
+                .limit(100)
+                .find({ suppressAuth: true, consistentRead: true }),
             API_TIMEOUT_MS,
             "queryRefundsForOrder"
         );

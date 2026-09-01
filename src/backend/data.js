@@ -1,7 +1,7 @@
 /*
 =============================================================================
 MODULE: backend/data.js
-VERSION: marianmadrid4002 (v21.1.0-LTS-remediated-cas-hooks)
+VERSION: marianmadrid4003 (v21.1.2-LTS-remediated-cas-hooks-guard)
 RESPONSIBILITY: CMS data hooks for canonical dates, immutable fiscal records,
             immutable labor records, and optimistic versioning for CitasF2.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
@@ -263,7 +263,9 @@ export function CitasF2_beforeUpdate(item, context) {
     if (item[CITA_FIELDS.STATUS_PAGO]) {
         item[CITA_FIELDS.STATUS_PAGO] = String(item[CITA_FIELDS.STATUS_PAGO]).toUpperCase();
     }
-    item.version = (Number(item.version) || 0) + 1;
+    if (item.version !== undefined && item.version !== null) {
+        item.version = Number(item.version) || 1;
+    }
     return item;
 }
 
