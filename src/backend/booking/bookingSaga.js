@@ -1,7 +1,7 @@
 /*
 =============================================================================
 MODULE: backend/booking/bookingSaga.js
-VERSION: marianmadrid4002 (v21.1.0-LTS-remediated)
+VERSION: marianmadrid4003 (v21.1.1-LTS-remediated-round-money)
 RESPONSIBILITY: Transactional Saga Orchestrator for simple and dual bookings.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
@@ -27,6 +27,7 @@ import {
     withTimeout,
     _isValidEmail,
     _maskEmail,
+    _roundMoney,
     _sumAddons,
     _extractRelationalId,
 } from "public/mmUtils";
