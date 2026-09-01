@@ -1,40 +1,38 @@
-/**
- * =============================================================================
- * FILE: backend/fiscalAggregator.web.js
- * VERSION: v19.6.16-fiscal-aggregator-aeat
- * RESPONSIBILITY: Produces tax-review summaries and an internal supporting
- *                 ledger extract from the immutable financial ledger.
- *                 Outputs require professional review and are not official filings.
- * STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
- * =============================================================================
- */
+/*
+=============================================================================
+MODULE: backend/fiscalAggregator.web.js
+VERSION: marianmadrid4002 (v21.1.2-LTS-remediated-phase3-chunked-queries)
+RESPONSIBILITY: Produces tax-review summaries and an internal supporting
+            ledger extract from the immutable financial ledger with chunked bounded queries.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
 
 import { webMethod, Permissions } from "wix-web-module";
 import wixData from "wix-data";
 import {
     COLLECTIONS,
     SDK_CONFIG,
-    TIPO_MOVIMIENTO
+    TIPO_MOVIMIENTO,
 } from "backend/internalConfig";
 import {
     makeTraceId,
     withTimeout,
-    _safeTrim
+    _safeTrim,
+    _roundMoney,
 } from "public/mmUtils";
 import {
     requireAdmin,
     requireCajero,
-    rateLimiter
+    rateLimiter,
 } from "backend/security";
 import { logger } from "backend/booking/bookingCore";
+import { _toPublicError } from "backend/responseUtils";
 
 const log = logger;
 const CMS_TIMEOUT_MS = Number(SDK_CONFIG?.TIMEOUTS?.CMS_MS) || 15000;
-const MAX_PAGES = Number(SDK_CONFIG?.JOBS?.FISCAL_DAILY_MAX_PAGES) || 10;
-
-function _toPublicError(err, fallbackCode = "FISCAL_ERROR", fallbackMessage = "Error en agregacion fiscal") {
-    return { code: String(err?.code || fallbackCode), message: String(err?.message || fallbackMessage) };
-}
+const CHUNK_PAGE_SIZE = 100;
+const MAX_PAGES = Number(SDK_CONFIG?.JOBS?.FISCAL_DAILY_MAX_PAGES) || 50;
 
 function _rateLimitOrThrow(surface, key, traceId) {
     const rl = rateLimiter({ surface, key });
@@ -55,7 +53,7 @@ function _getQuarterMonths(year, quarter) {
         1: ["01", "02", "03"],
         2: ["04", "05", "06"],
         3: ["07", "08", "09"],
-        4: ["10", "11", "12"]
+        4: ["10", "11", "12"],
     };
 
     return monthMap[q].map((m) => `${y}-${m}`);
@@ -68,14 +66,14 @@ async function _queryAllQuarterMovements(months, traceId) {
     const query = wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA)
         .hasSome("mesKey", months)
         .ascending("seqGlobal")
-        .limit(1000);
+        .limit(CHUNK_PAGE_SIZE);
 
-    let res = await withTimeout(query.find({ suppressAuth: true }), CMS_TIMEOUT_MS, "queryQuarterMovements_p1");
+    let res = await withTimeout(query.find({ suppressAuth: true, consistentRead: true }), CMS_TIMEOUT_MS, "queryQuarterMovements_p1");
     allItems = allItems.concat(res?.items || []);
 
     let page = 2;
     while (res && res.hasNext() && page <= MAX_PAGES) {
-        res = await withTimeout(res.next(), CMS_TIMEOUT_MS, `queryQuarterMovements_p${page}`);
+        res = await withTimeout(res.next({ suppressAuth: true, consistentRead: true }), CMS_TIMEOUT_MS, `queryQuarterMovements_p${page}`);
         allItems = allItems.concat(res?.items || []);
         page++;
     }
@@ -122,7 +120,7 @@ export const getQuarterlyTaxSummary = webMethod(Permissions.SiteMember, async (y
             efectivo: 0,
             tarjeta: 0,
             bizum: 0,
-            online: 0
+            online: 0,
         };
 
         const breakdownByMonth = {};
@@ -140,7 +138,11 @@ export const getQuarterlyTaxSummary = webMethod(Permissions.SiteMember, async (y
             const tasaIva = Number(m.tasaIva) || 0;
             const tasaIvaKey = String(tasaIva);
             const tipoMovimiento = _safeTrim(m.tipoMovimiento).toUpperCase();
-            const naturaleza = _safeTrim(m.naturalezaOperacion).toUpperCase() || (tipoMovimiento === TIPO_MOVIMIENTO.PROPINA ? "PROPINA" : tipoMovimiento === TIPO_MOVIMIENTO.REEMBOLSO || importeContable < 0 ? "DEVOLUCION" : tipoMovimiento === TIPO_MOVIMIENTO.AJUSTE ? "AJUSTE" : "VENTA");
+            const naturaleza = _safeTrim(m.naturalezaOperacion).toUpperCase() || (
+                tipoMovimiento === TIPO_MOVIMIENTO.PROPINA ? "PROPINA" :
+                tipoMovimiento === TIPO_MOVIMIENTO.REEMBOLSO || importeContable < 0 ? "DEVOLUCION" :
+                tipoMovimiento === TIPO_MOVIMIENTO.AJUSTE ? "AJUSTE" : "VENTA"
+            );
 
             if (breakdownByPaymentMethod[formaPago] !== undefined) {
                 breakdownByPaymentMethod[formaPago] += importeContable;
@@ -185,63 +187,60 @@ export const getQuarterlyTaxSummary = webMethod(Permissions.SiteMember, async (y
             breakdownByVatRate[tasaIvaKey].operaciones++;
         }
 
-        const round2 = (num) => Math.round((Number(num) || 0) * 100) / 100;
-
         return {
             status: "SUCCESS",
             data: {
                 ejercicio: y,
                 trimestre: q,
                 periodoMeses: months,
-                                    totalOperaciones: items.length,
-                    totalOperacionesFiscales: countFiscal,
-                    conteo: {
-                        ventas: countVentas,
-                        reembolsos: countReembolsos,
-                        propinas: countPropinas,
-                        ajustes: countAjustes
-                    },
-                    borradorIva: {
-                        estado: "REVISION_PROFESIONAL_REQUERIDA",
-                        baseImponibleRegistrada: round2(totalBaseImponible),
-                        cuotaIvaRegistrada: round2(totalCuotaIva),
-                        nota: "No es un Modelo 303 ni una declaracion preparada para presentar. Los tipos y el regimen deben ser validados por la gestoria."
-                    },
-                    borradorIngresos: {
-                        estado: "REVISION_PROFESIONAL_REQUERIDA",
-                        ingresosRegistrados: round2(totalBaseImponible),
-                        nota: "No es un Modelo 130 ni una declaracion preparada para presentar."
-                    },
-                    totales: {
-                        totalVentasBrutas: round2(totalVentas),
-                        totalReembolsos: round2(totalReembolsos),
-                        totalFacturadoNeto: round2(totalFacturado),
-                        totalPropinasSeparadas: round2(totalPropinas),
-                        totalAjustesSeparados: round2(totalAjustes)
-                    },
-
+                totalOperaciones: items.length,
+                totalOperacionesFiscales: countFiscal,
+                conteo: {
+                    ventas: countVentas,
+                    reembolsos: countReembolsos,
+                    propinas: countPropinas,
+                    ajustes: countAjustes,
+                },
+                borradorIva: {
+                    estado: "REVISION_PROFESIONAL_REQUERIDA",
+                    baseImponibleRegistrada: _roundMoney(totalBaseImponible),
+                    cuotaIvaRegistrada: _roundMoney(totalCuotaIva),
+                    nota: "No es un Modelo 303 oficial. Requiere validacion previa por gestoria.",
+                },
+                borradorIngresos: {
+                    estado: "REVISION_PROFESIONAL_REQUERIDA",
+                    ingresosRegistrados: _roundMoney(totalBaseImponible),
+                    nota: "No es un Modelo 130 oficial. Requiere validacion previa por gestoria.",
+                },
+                totales: {
+                    totalVentasBrutas: _roundMoney(totalVentas),
+                    totalReembolsos: _roundMoney(totalReembolsos),
+                    totalFacturadoNeto: _roundMoney(totalFacturado),
+                    totalPropinasSeparadas: _roundMoney(totalPropinas),
+                    totalAjustesSeparados: _roundMoney(totalAjustes),
+                },
                 desgloseFormaPago: {
-                    efectivo: round2(breakdownByPaymentMethod.efectivo),
-                    tarjeta: round2(breakdownByPaymentMethod.tarjeta),
-                    bizum: round2(breakdownByPaymentMethod.bizum),
-                    online: round2(breakdownByPaymentMethod.online)
+                    efectivo: _roundMoney(breakdownByPaymentMethod.efectivo),
+                    tarjeta: _roundMoney(breakdownByPaymentMethod.tarjeta),
+                    bizum: _roundMoney(breakdownByPaymentMethod.bizum),
+                    online: _roundMoney(breakdownByPaymentMethod.online),
                 },
                 desgloseMensual: Object.keys(breakdownByMonth).map((mesKey) => ({
                     mesKey,
-                    baseImponible: round2(breakdownByMonth[mesKey].baseImponible),
-                    cuotaIva: round2(breakdownByMonth[mesKey].cuotaIva),
-                    total: round2(breakdownByMonth[mesKey].total),
-                    operaciones: breakdownByMonth[mesKey].count
+                    baseImponible: _roundMoney(breakdownByMonth[mesKey].baseImponible),
+                    cuotaIva: _roundMoney(breakdownByMonth[mesKey].cuotaIva),
+                    total: _roundMoney(breakdownByMonth[mesKey].total),
+                    operaciones: breakdownByMonth[mesKey].count,
                 })),
                 desgloseTipoIva: Object.values(breakdownByVatRate).map((item) => ({
                     tasaIva: item.tasaIva,
-                    baseImponible: round2(item.baseImponible),
-                    cuotaIva: round2(item.cuotaIva),
-                    total: round2(item.total),
-                    operaciones: item.operaciones
-                }))
+                    baseImponible: _roundMoney(item.baseImponible),
+                    cuotaIva: _roundMoney(item.cuotaIva),
+                    total: _roundMoney(item.total),
+                    operaciones: item.operaciones,
+                })),
             },
-            error: null
+            error: null,
         };
     } catch (err) {
         log.error("getQuarterlyTaxSummary failed", { error: err?.message, traceId });
@@ -266,7 +265,7 @@ export const getLibroRegistroFacturasExpedidas = webMethod(Permissions.Admin, as
 
         const libroFilas = items.map((m, idx) => ({
             orden: idx + 1,
-            numTicketFactura: _safeTrim(m.numTicketFactura),
+            numTicketFactura: _safeTrim(m.numTicketFactura || m.numeroTicket),
             fechaExpedicion: _safeTrim(m.diaKey),
             tipoFactura: m.tipoMovimiento === "REEMBOLSO" || Number(m.importeContable) < 0 ? "R1" : "BORRADOR_INTERNO",
             tipoMovimiento: _safeTrim(m.tipoMovimiento),
@@ -275,10 +274,10 @@ export const getLibroRegistroFacturasExpedidas = webMethod(Permissions.Admin, as
             incluidoEnBorradorIva: _safeTrim(m.naturalezaOperacion).toUpperCase() !== "PROPINA" && _safeTrim(m.naturalezaOperacion).toUpperCase() !== "AJUSTE",
             referenciaRectificativa: _safeTrim(m.referenciaRectificativa) || null,
             formaPago: _safeTrim(m.formaPago),
-            baseImponible: Number(m.baseImponible) || 0,
+            baseImponible: _roundMoney(m.baseImponible),
             tipoIva: `${Math.round((Number(m.tasaIva) || 0) * 100)}%`,
-            cuotaIva: Number(m.cuotaIva) || 0,
-            importeTotal: Number(m.importeContable) || 0,
+            cuotaIva: _roundMoney(m.cuotaIva),
+            importeTotal: _roundMoney(m.importeContable),
             concepto: _safeTrim(m.concepto),
             origen: _safeTrim(m.origen),
             orderId: _safeTrim(m.orderId) || null,
@@ -287,7 +286,7 @@ export const getLibroRegistroFacturasExpedidas = webMethod(Permissions.Admin, as
             huellaSha256: _safeTrim(m.hashCadena).slice(0, 8).toUpperCase(),
             hashCompleto: _safeTrim(m.hashCadena),
             reservaVinculada: _safeTrim(m.reservaIdVinculada) || null,
-            transactionId: _safeTrim(m.transactionId)
+            transactionId: _safeTrim(m.transactionId),
         }));
 
         return {
@@ -296,9 +295,9 @@ export const getLibroRegistroFacturasExpedidas = webMethod(Permissions.Admin, as
                 ejercicio: y,
                 trimestre: q,
                 totalRegistros: libroFilas.length,
-                filas: libroFilas
+                filas: libroFilas,
             },
-            error: null
+            error: null,
         };
     } catch (err) {
         log.error("getLibroRegistroFacturasExpedidas failed", { error: err?.message, traceId });
