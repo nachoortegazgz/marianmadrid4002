@@ -1,33 +1,12 @@
 /**
  * =============================================================================
  * MODULE: pages/servicio-2.js
- * VERSION: v21.0.2-canonical-service-widget-image-fallback
+ * VERSION: v21.1.1-stable-service-page
  * STANDARDS: G10 ASCII Strict.
- *
- * HISTORIAL:
- * - v21.0.2:
- *   Removes the unsafe UI dependency, adds local configuration, validates the
- *   canonical service context, preserves serviceId and slugUrl, and sends a
- *   default SVG image to the HTML widget.
- * - v19.6.15:
- *   Preserves canonical duracionTotal with nullish fallbacks.
- * - v19.6.14:
- *   Emits serviceId only and removes legacy service aliases.
- * - v19.6.10:
- *   Sends canonical service context to the active HTML widget.
- * - v19.6.7:
- *   Uses the widget READY handshake before context delivery.
- * - v19.4.6:
- *   Validates local add-on IDs before calendar navigation.
- * - v19.4.4:
- *   Resolves Import2 by slugUrl first and serviceId second.
- * - v19.4.2:
- *   Adds a verified default service image fallback.
  * =============================================================================
  */
 
 import wixLocation from "wix-location";
-import wixWindowFrontend from "wix-window-frontend";
 import { getServiceBySlugOrId } from "backend/reservas.web";
 
 import {
@@ -46,25 +25,6 @@ import {
 
 import { createWidgetBridge } from "public/widgetBridge";
 
-const DEFAULT_SERVICE_IMAGE_URL =
-  "data:image/svg+xml;charset=UTF-8," +
-  encodeURIComponent(`
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">
-      <rect width="1200" height="800" fill="#e9e2d9"/>
-      <circle cx="930" cy="170" r="210" fill="#d8bea0"/>
-      <rect x="105" y="180" width="530" height="450"
-        rx="30" fill="#f7f3ee"/>
-      <text x="160" y="420"
-        fill="#342b24"
-        font-family="Georgia, serif"
-        font-size="68">MARIAN</text>
-      <text x="160" y="500"
-        fill="#342b24"
-        font-family="Georgia, serif"
-        font-size="68">MADRID</text>
-    </svg>
-  `);
-
 const CONFIG = Object.freeze({
   HANDSHAKE_TIMEOUT_MS: 10000,
   CONTEXT_TIMEOUT_MS: 60000,
@@ -74,25 +34,46 @@ const CONFIG = Object.freeze({
   DEFAULT_DURATION_MINUTES: 30,
   DEFAULT_LOCATION: "Marian Madrid",
   DEFAULT_CURRENCY: "EUR",
-  DEFAULT_SERVICE_IMAGE_URL
+  DEFAULT_TITLE: "Servicio",
+  DEFAULT_SUMMARY: "Marian Madrid",
+  DEFAULT_DESCRIPTION: "Detalles no disponibles.",
+  DEFAULT_IMAGE_URL:
+    "wix:image://v1/ab7708_374e5f7adb2f47f3944f3355da129b80~mv2.jpg/hair-salon-hd.jpg.jfif.jpg#originWidth=2048&originHeight=1143"
 });
 
-function _isGuid(value) {
+function isGuid(value) {
   const clean = String(value || "").trim();
-  return clean && _looksLikeGuid(clean) ? clean : "";
+
+  return clean && _looksLikeGuid(clean)
+    ? clean
+    : "";
 }
 
-function _isSlug(value) {
+function isSlug(value) {
   const clean = _safeSlugOrId(value || "");
-  return clean && !_isGuid(clean) ? clean : "";
+
+  return clean && !isGuid(clean)
+    ? clean
+    : "";
 }
 
-function _safeNumber(value, fallback = 0) {
+function safeNumber(value, fallback = 0) {
   const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
+
+  return Number.isFinite(number)
+    ? number
+    : fallback;
 }
 
-function _safeMetadata(value) {
+function safePositiveNumber(value, fallback = 0) {
+  const number = safeNumber(value, fallback);
+
+  return number >= 0
+    ? number
+    : fallback;
+}
+
+function safeMetadata(value) {
   return value &&
     typeof value === "object" &&
     !Array.isArray(value)
@@ -100,118 +81,10 @@ function _safeMetadata(value) {
     : {};
 }
 
-async function _resolveServiceLookup() {
-  const query = wixLocation.query || {};
-  let appService = {};
-
-  try {
-    const pageData = await wixWindowFrontend.getAppPageData();
-    appService = pageData?.service || {};
-  } catch (error) {
-    console.warn(
-      "[servicio-2] getAppPageData unavailable",
-      error?.message || String(error)
-    );
-  }
-
-  const slugCandidates = [
-    query.slugUrl,
-    query.slug,
-    query.serviceKey,
-    appService?.supportedSlugs?.[0]?.name,
-    appService?.slugUrl,
-    appService?.slug
-  ];
-
-  for (const candidate of slugCandidates) {
-    const slugUrl = _isSlug(candidate);
-
-    if (slugUrl) {
-      return {
-        kind: "SLUG",
-        value: slugUrl
-      };
-    }
-  }
-
-  const guidCandidates = [
-    query.serviceId,
-    appService?.id,
-    appService?._id
-  ];
-
-  for (const candidate of guidCandidates) {
-    const serviceId = _isGuid(candidate);
-
-    if (serviceId) {
-      return {
-        kind: "GUID",
-        value: serviceId
-      };
-    }
-  }
-
-  const path = wixLocation.path || [];
-  const pathCandidate = _isSlug(path[path.length - 1] || "");
-
-  const excluded = [
-    "servicios",
-    "service",
-    "servicio",
-    "servicio-2",
-    "pagina-de-servicio-2"
-  ];
-
-  if (pathCandidate && !excluded.includes(pathCandidate)) {
-    return {
-      kind: "SLUG",
-      value: pathCandidate
-    };
-  }
-
-  return null;
-}
-
-async function _fetchServiceFromBackend(lookup) {
-  if (!lookup?.value) {
-    throw new Error("Service lookup is required");
-  }
-
-  const result = await _executeWithRetry(
-    () =>
-      withTimeout(
-        getServiceBySlugOrId(lookup.value),
-        CONFIG.FRONTEND_API_TIMEOUT_MS,
-        `getServiceBySlugOrId:${lookup.kind}`
-      ),
-    CONFIG.FRONTEND_RETRY_ATTEMPTS,
-    CONFIG.FRONTEND_RETRY_BASE_BACKOFF_MS
+function showError(message) {
+  const safeMessage = String(
+    message || "No se pudo cargar el servicio."
   );
-
-  if (!result || result.status !== "SUCCESS" || !result.data) {
-    throw new Error(
-      result?.error?.message || "Service not found in Import2"
-    );
-  }
-
-  const serviceId = _isGuid(result.data.serviceId);
-  const slugUrl = _isSlug(result.data.slugUrl);
-
-  if (!serviceId || !slugUrl) {
-    throw new Error(
-      "Import2 service is missing serviceId or slugUrl"
-    );
-  }
-
-  return {
-    ...result.data,
-    serviceId,
-    slugUrl
-  };
-}
-
-function _showError(message) {
-  const safeMessage = String(message || "Unknown error");
 
   console.error("[servicio-2] Error:", safeMessage);
 
@@ -227,121 +100,165 @@ function _showError(message) {
     }
   } catch (error) {
     console.warn(
-      "[servicio-2] error banner unavailable",
+      "[servicio-2] Error banner unavailable:",
       error?.message || String(error)
     );
   }
 }
 
-function _sanitizeRequestedAddonIds(rawAddons, resolvedService) {
-  const metadata = _safeMetadata(resolvedService?.metadata);
+async function resolveServiceLookup() {
+  const query = wixLocation.query || {};
 
-  const catalog = Array.isArray(metadata.addons)
-    ? metadata.addons
-    : [];
-
-  const allowedIds = new Set(
-    catalog
-      .map((addon) => _safeTrim(addon?.addonId))
-      .filter(Boolean)
-  );
-
-  const requestedIds = Array.from(
-    new Set(
-      (Array.isArray(rawAddons) ? rawAddons : [])
-        .map((addon) => {
-          if (addon && typeof addon === "object") {
-            return _safeTrim(addon.addonId);
-          }
-
-          return _safeTrim(addon);
-        })
-        .filter((addonId) => allowedIds.has(addonId))
-    )
-  );
-
-  const maxAddons = _safeNumber(
-    BOOKINGS_ADDON_CONFIG?.MAX_PER_BOOKING,
-    10
-  );
-
-  return requestedIds.slice(0, maxAddons);
-}
-
-function _goToCalendar(slugUrl, serviceId, addonIds = []) {
-  const canonicalSlugUrl = _isSlug(slugUrl);
-  const canonicalGuid = _isGuid(serviceId);
-
-  if (!canonicalSlugUrl || !canonicalGuid) {
-    _showError(
-      "No se pudo identificar el servicio para continuar la reserva."
-    );
-    return;
-  }
-
-  const base =
-    URLS?.CALENDARIO_2 ||
-    "/booking-calendar/calendario-2";
-
-  const query = [
-    `slugUrl=${encodeURIComponent(canonicalSlugUrl)}`,
-    `serviceId=${encodeURIComponent(canonicalGuid)}`,
-    `referral=service2`
+  const slugCandidates = [
+    query.slugUrl,
+    query.slug,
+    query.serviceKey
   ];
 
-  if (addonIds.length > 0) {
-    query.push(
-      `addonIds=${encodeURIComponent(addonIds.join(","))}`
+  for (const candidate of slugCandidates) {
+    const slugUrl = isSlug(candidate);
+
+    if (slugUrl) {
+      return {
+        kind: "SLUG",
+        value: slugUrl
+      };
+    }
+  }
+
+  const guidCandidates = [
+    query.serviceId
+  ];
+
+  for (const candidate of guidCandidates) {
+    const serviceId = isGuid(candidate);
+
+    if (serviceId) {
+      return {
+        kind: "GUID",
+        value: serviceId
+      };
+    }
+  }
+
+  const path = Array.isArray(wixLocation.path)
+    ? wixLocation.path
+    : [];
+
+  const excludedPaths = new Set([
+    "servicios",
+    "service",
+    "servicio",
+    "servicio-2",
+    "pagina-de-servicio-2"
+  ]);
+
+  const pathCandidate = isSlug(
+    path[path.length - 1] || ""
+  );
+
+  if (
+    pathCandidate &&
+    !excludedPaths.has(pathCandidate)
+  ) {
+    return {
+      kind: "SLUG",
+      value: pathCandidate
+    };
+  }
+
+  return null;
+}
+
+async function fetchServiceFromBackend(lookup) {
+  if (!lookup?.value) {
+    throw new Error(
+      "Service lookup is required"
     );
   }
 
-  wixLocation.to(`${base}?${query.join("&")}`);
-}
-
-function _goToServices() {
-  wixLocation.to(
-    URLS?.SERVICIOS || "/reserva-online"
+  const result = await _executeWithRetry(
+    () =>
+      withTimeout(
+        getServiceBySlugOrId(lookup.value),
+        CONFIG.FRONTEND_API_TIMEOUT_MS,
+        `getServiceBySlugOrId:${lookup.kind}`
+      ),
+    CONFIG.FRONTEND_RETRY_ATTEMPTS,
+    CONFIG.FRONTEND_RETRY_BASE_BACKOFF_MS
   );
-}
 
-function _buildContext(data, traceId) {
-  const metadata = _safeMetadata(data?.metadata);
-  const serviceId = _isGuid(data?.serviceId);
-  const slugUrl = _isSlug(data?.slugUrl);
-
-  if (!serviceId || !slugUrl) {
-    throw new Error("Invalid canonical service context");
+  if (
+    !result ||
+    result.status !== "SUCCESS" ||
+    !result.data
+  ) {
+    throw new Error(
+      result?.error?.message ||
+      "Service not found"
+    );
   }
 
-  const tituloServicio =
+  const serviceId = isGuid(
+    result.data.serviceId
+  );
+
+  const slugUrl = isSlug(
+    result.data.slugUrl
+  );
+
+  if (!serviceId || !slugUrl) {
+    throw new Error(
+      "Service is missing serviceId or slugUrl"
+    );
+  }
+
+  return {
+    ...result.data,
+    serviceId,
+    slugUrl
+  };
+}
+
+function buildContext(data, traceId) {
+  const metadata = safeMetadata(
+    data?.metadata
+  );
+
+  const serviceId = isGuid(
+    data?.serviceId
+  );
+
+  const slugUrl = isSlug(
+    data?.slugUrl
+  );
+
+  if (!serviceId || !slugUrl) {
+    throw new Error(
+      "Invalid canonical service context"
+    );
+  }
+
+  const title =
     _safeTrim(
       metadata.tituloServicio ||
-      metadata.titulo ||
-      "Servicio"
-    ) || "Servicio";
+      metadata.titulo
+    ) || CONFIG.DEFAULT_TITLE;
 
-  const precio = _safeNumber(
+  const price = safePositiveNumber(
     metadata.precio ??
     metadata.pricing?.base,
     0
   );
 
-  const duracionTotal = _safeNumber(
+  const duration = safePositiveNumber(
     metadata.duracionTotal ??
     metadata.timing?.estimatedTotal ??
     metadata.timing?.totalDuration,
     CONFIG.DEFAULT_DURATION_MINUTES
   );
 
-  const addons = Array.isArray(metadata.addons)
-    ? metadata.addons
-    : [];
-
-  const imageUrl =
-    _safeTrim(metadata.imageUrl) ||
-    CONFIG.DEFAULT_SERVICE_IMAGE_URL;
-
-  const localizacion =
+  const location =
     _safeTrim(metadata.localizacion) ||
     CONFIG.DEFAULT_LOCATION;
 
@@ -352,80 +269,192 @@ function _buildContext(data, traceId) {
       CONFIG.DEFAULT_CURRENCY
     ) || CONFIG.DEFAULT_CURRENCY;
 
+  const addons = Array.isArray(
+    metadata.addons
+  )
+    ? metadata.addons
+    : [];
+
   return {
     ...data,
     traceId,
     serviceId,
     slugUrl,
     slug: slugUrl,
-    permitirCombinar: Boolean(data.permitirCombinar),
-
+    permitirCombinar: Boolean(
+      data.permitirCombinar
+    ),
     metadata: {
       ...metadata,
-      titulo: tituloServicio,
-      tituloServicio,
-      precio,
-      duracionTotal,
-      localizacion,
-
+      titulo: title,
+      tituloServicio: title,
+      precio: price,
+      duracionTotal: duration,
+      localizacion: location,
       resumenCorto:
         _safeTrim(metadata.resumenCorto) ||
-        "Marian Madrid",
-
+        CONFIG.DEFAULT_SUMMARY,
       descripcionLarga:
         _safeTrim(metadata.descripcionLarga) ||
-        "Detalles no disponibles.",
-
-      recomendacionProductoRef:
-        _safeTrim(metadata.recomendacionProductoRef),
-
-      recomendacionProductoRef2:
-        _safeTrim(metadata.recomendacionProductoRef2),
-
+        CONFIG.DEFAULT_DESCRIPTION,
+      imageUrl:
+        _safeTrim(metadata.imageUrl) ||
+        CONFIG.DEFAULT_IMAGE_URL,
       addons,
-
       addonsPrecio: addons.map((addon) =>
-        _safeNumber(addon?.precio, 0)
+        safePositiveNumber(
+          addon?.precio,
+          0
+        )
       ),
-
-      imageUrl,
-
       pricing: {
-        base: precio,
+        base: price,
         currency
       },
-
       timing: {
-        estimatedTotal: duracionTotal,
-        totalDuration: duracionTotal
+        estimatedTotal: duration,
+        totalDuration: duration
       }
     },
-
-    staffOptions: Array.isArray(data.staffOptions)
+    staffOptions: Array.isArray(
+      data.staffOptions
+    )
       ? data.staffOptions
       : [],
-
-    staffDisponible: Array.isArray(data.staffDisponible)
+    staffDisponible: Array.isArray(
+      data.staffDisponible
+    )
       ? data.staffDisponible
       : []
   };
 }
 
-$w.onReady(async function () {
-  const traceId = makeTraceId("servicio");
-  const widget = $w("#htmlWidgetCustomService");
+function sanitizeAddonIds(rawAddons, service) {
+  const metadata = safeMetadata(
+    service?.metadata
+  );
 
-  if (!widget || typeof widget.postMessage !== "function") {
-    _showError("HTML widget not found or incompatible.");
+  const catalog = Array.isArray(
+    metadata.addons
+  )
+    ? metadata.addons
+    : [];
+
+  const allowedIds = new Set(
+    catalog
+      .map((addon) =>
+        _safeTrim(addon?.addonId)
+      )
+      .filter(Boolean)
+  );
+
+  const requested = Array.isArray(
+    rawAddons
+  )
+    ? rawAddons
+    : [];
+
+  const validIds = Array.from(
+    new Set(
+      requested
+        .map((addon) => {
+          if (
+            addon &&
+            typeof addon === "object"
+          ) {
+            return _safeTrim(
+              addon.addonId
+            );
+          }
+
+          return _safeTrim(addon);
+        })
+        .filter((addonId) =>
+          allowedIds.has(addonId)
+        )
+    )
+  );
+
+  const maxAddons = safePositiveNumber(
+    BOOKINGS_ADDON_CONFIG?.MAX_PER_BOOKING,
+    10
+  );
+
+  return validIds.slice(0, maxAddons);
+}
+
+function goToCalendar(service, addonIds = []) {
+  const slugUrl = isSlug(
+    service?.slugUrl
+  );
+
+  const serviceId = isGuid(
+    service?.serviceId
+  );
+
+  if (!slugUrl || !serviceId) {
+    showError(
+      "No se pudo identificar el servicio para continuar."
+    );
+    return;
+  }
+
+  const base =
+    URLS?.CALENDARIO_2 ||
+    "/booking-calendar/calendario-2";
+
+  const query = [
+    `slugUrl=${encodeURIComponent(slugUrl)}`,
+    `serviceId=${encodeURIComponent(serviceId)}`,
+    "referral=servicio-2"
+  ];
+
+  if (addonIds.length > 0) {
+    query.push(
+      `addonIds=${encodeURIComponent(
+        addonIds.join(",")
+      )}`
+    );
+  }
+
+  wixLocation.to(
+    `${base}?${query.join("&")}`
+  );
+}
+
+function goToServices() {
+  wixLocation.to(
+    URLS?.SERVICIOS ||
+    "/reserva-online"
+  );
+}
+
+$w.onReady(async () => {
+  const traceId = makeTraceId(
+    "servicio"
+  );
+
+  const widget = $w(
+    "#htmlWidgetCustomService"
+  );
+
+  if (
+    !widget ||
+    typeof widget.postMessage !== "function"
+  ) {
+    showError(
+      "HTML widget not found or incompatible."
+    );
     return;
   }
 
   try {
-    const lookup = await _resolveServiceLookup();
+    const lookup =
+      await resolveServiceLookup();
 
     if (!lookup) {
-      _showError(
-        "No se pudo localizar slugUrl ni serviceId del servicio."
+      showError(
+        "No se pudo localizar el servicio."
       );
       return;
     }
@@ -435,35 +464,51 @@ $w.onReady(async function () {
     createWidgetBridge(widget, {
       slug: lookup.value,
       traceId,
-      handshakeTimeoutMs: CONFIG.HANDSHAKE_TIMEOUT_MS,
-      contextTimeoutMs: CONFIG.CONTEXT_TIMEOUT_MS,
+      handshakeTimeoutMs:
+        CONFIG.HANDSHAKE_TIMEOUT_MS,
+      contextTimeoutMs:
+        CONFIG.CONTEXT_TIMEOUT_MS,
 
       onContextReady: async () => {
         resolvedService =
-          await _fetchServiceFromBackend(lookup);
+          await fetchServiceFromBackend(
+            lookup
+          );
 
-        return _buildContext(
+        return buildContext(
           resolvedService,
           traceId
         );
       },
 
       onWidgetMessage: async (message) => {
-        const type = _normType(message?.type);
-        const payload = message?.payload || {};
+        const type = _normType(
+          message?.type
+        );
+
+        const payload =
+          message?.payload || {};
+
+        if (!resolvedService) {
+          showError(
+            "El servicio todavía está cargando."
+          );
+          return;
+        }
 
         if (
-          type === _normType(MESSAGE_TYPES.BOOK)
+          type === _normType(
+            MESSAGE_TYPES.BOOK
+          )
         ) {
           const addonIds =
-            _sanitizeRequestedAddonIds(
+            sanitizeAddonIds(
               payload.addons,
               resolvedService
             );
 
-          _goToCalendar(
-            resolvedService?.slugUrl,
-            resolvedService?.serviceId,
+          goToCalendar(
+            resolvedService,
             addonIds
           );
 
@@ -471,7 +516,9 @@ $w.onReady(async function () {
         }
 
         if (
-          type === _normType(MESSAGE_TYPES.NAV)
+          type === _normType(
+            MESSAGE_TYPES.NAV
+          )
         ) {
           const target = String(
             payload.target || ""
@@ -480,38 +527,32 @@ $w.onReady(async function () {
             .toUpperCase();
 
           if (
-            target === "SERVICIOS" ||
-            target === "BACK"
-          ) {
-            _goToServices();
-            return;
-          }
-
-          if (
             target === "CALENDARIO2" ||
             target.includes("CALENDAR")
           ) {
-            _goToCalendar(
-              resolvedService?.slugUrl,
-              resolvedService?.serviceId
+            goToCalendar(
+              resolvedService
             );
             return;
           }
 
-          _goToServices();
+          goToServices();
         }
       },
 
       onError: (error) => {
-        _showError(
-          error?.message || String(error)
+        showError(
+          error?.message ||
+          "No se pudo cargar el servicio."
         );
       }
     });
   } catch (error) {
-    _showError(
+    showError(
       error?.message ||
       "No se pudo cargar el servicio."
     );
   }
 });
+
+La imagen queda configurada como fallback cuando `metadata.imageUrl` está vacío.
