@@ -1,25 +1,13 @@
-/**
- * =============================================================================
- * MODULE: backend/cajas.web.js
- * VERSION: v20.0.0-resilient-caja-status-guards
- * RESPONSIBILITY: Internal financial ledger with SHA-256 hash chains,
- * idempotent transaction recording, and chain integrity verification.
- * It provides technical controls and does not claim tax certification.
- * STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
- * HISTORIAL:
- * - v20.0.0-resilient-caja-status-guards: Adds backward-compatible closed status guards
- *   supporting both CLOSED and CERRADA, hardens Z-closing projections and recovery.
- * - v20.0.0-optimized-guards-shared-kernel: Adds immediate feature-flag guards
- *   for accounting and M365 projections, reuses centralized utilities from
- *   mmUtils.js and responseUtils.js, and maintains strict ledger immutability.
- * - v19.6.3-prioritized-reliability-refactor: Removes duplicated catalog and slot paths, restores Codegem fixes, and hardens persistence.
- * - v19.5.3-fiscal-recovery-finalization: Finalizes CitasF2 PAID state only after a recovered online ledger succeeds and flags exhausted recoveries for review.
- * - v19.5.1-global-ledger-chain-audit: Verifies each daily slice against its predecessor in the global immutable hash chain and uses SSOT ledger timing.
- * - v19.5.0-staff-dashboard-presentation: Aligns authorized cashier read and operational methods with the Only Staff RBAC contract.
- * - v19.2.0-fiscal-recovery-hardened: Adds durable idempotent fiscal recovery queue.
- * - v19.0.0-final: Header standardized during V2 compliance review.
- * =============================================================================
- */
+/*
+=============================================================================
+MODULE: backend/cajas.web.js
+VERSION: marianmadrid4002 (v21.1.0-LTS-remediated)
+RESPONSIBILITY: Internal financial ledger with SHA-256 hash chains,
+            idempotent transaction recording, and chain integrity verification.
+            Complies with Veri*Factu and RD-Ley 8/2019 principles.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
 
 import { webMethod, Permissions } from "wix-web-module";
 import wixData from "wix-data";
@@ -32,6 +20,7 @@ import {
     _stableSerialize,
     _normalizeIdPart,
     withTimeout,
+    _executeWithRetry,
 } from "public/mmUtils";
 import {
     COLLECTIONS,
@@ -70,6 +59,8 @@ const CMS_TIMEOUT_MS = SDK_CONFIG?.TIMEOUTS?.CMS_MS || 15000;
 
 const LEDGER_MUTEX_KEY = "LEDGER_GLOBAL_WRITE";
 const LEDGER_MUTEX_TTL_MS = Number(CONCURRENCY?.LEDGER_MUTEX_TTL_MS) || 45000;
+const FISCAL_SEQUENCE_MUTEX_KEY = "FISCAL_SEQUENCE_LOCK";
+const FISCAL_SEQUENCE_MUTEX_TTL_MS = 30000;
 const FISCAL_KEY_CACHE_TTL_MS = Number(SDK_CONFIG?.SECURITY?.SECRET_CACHE_TTL_MS) || 300000;
 
 let cachedFiscalKey = null;
@@ -134,59 +125,90 @@ function _canonicalPayloadV2(movement) {
 async function _getNextSequenceNumbers(year, traceId) {
     const SEQ_COLLECTION = COLLECTIONS.CONTADORES_FISCALES;
     const SEQ_ID = "GLOBAL";
+    const lockOwnerId = `${String(traceId || "seq")}_${Date.now()}`;
 
-    let seqDoc = await withTimeout(
-        wixData.get(SEQ_COLLECTION, SEQ_ID, { suppressAuth: true }).catch(() => null),
-        CMS_TIMEOUT_MS,
-        "getTicketSequence"
+    const lockResult = await _lockSlotKeyOrFail(
+        FISCAL_SEQUENCE_MUTEX_KEY,
+        lockOwnerId,
+        FISCAL_SEQUENCE_MUTEX_TTL_MS
     );
-
-    if (!seqDoc) {
-        seqDoc = await withTimeout(
-            wixData.insert(SEQ_COLLECTION, { _id: SEQ_ID, data: {} }, { suppressAuth: true }),
-            CMS_TIMEOUT_MS,
-            "createTicketSequence"
+    if (!lockResult?.ok) {
+        throw createBookingError(
+            ERROR_CODES.TOKEN_BUSY,
+            "Fiscal sequence generation busy, retry later",
+            { traceId }
         );
     }
 
-    const keyYear = String(year);
-    const seqData = seqDoc && typeof seqDoc.data === "object" && seqDoc.data ? seqDoc.data : {};
+    try {
+        return await _executeWithRetry(async () => {
+            let seqDoc = await withTimeout(
+                wixData.get(SEQ_COLLECTION, SEQ_ID, { suppressAuth: true, consistentRead: true }).catch(() => null),
+                CMS_TIMEOUT_MS,
+                "getTicketSequence"
+            );
 
-    const currentYearSeq = Number(seqData[keyYear] || 0);
-    const nextYearSeq = currentYearSeq + 1;
+            if (!seqDoc) {
+                try {
+                    seqDoc = await withTimeout(
+                        wixData.insert(SEQ_COLLECTION, { _id: SEQ_ID, data: {} }, { suppressAuth: true }),
+                        CMS_TIMEOUT_MS,
+                        "createTicketSequence"
+                    );
+                } catch (insertErr) {
+                    seqDoc = await withTimeout(
+                        wixData.get(SEQ_COLLECTION, SEQ_ID, { suppressAuth: true, consistentRead: true }),
+                        CMS_TIMEOUT_MS,
+                        "regetTicketSequenceAfterRace"
+                    );
+                }
+            }
 
-    const currentGlobalSeq = Number(seqData.seqGlobal || 0);
-    const nextGlobalSeq = currentGlobalSeq + 1;
+            const keyYear = String(year);
+            const seqData = seqDoc && typeof seqDoc.data === "object" && seqDoc.data ? seqDoc.data : {};
 
-    const { _createdDate, _updatedDate, _owner, ...safeSeqDoc } = seqDoc;
+            const currentYearSeq = Number(seqData[keyYear] || 0);
+            const nextYearSeq = currentYearSeq + 1;
 
-    const updated = {
-        ...safeSeqDoc,
-        _id: SEQ_ID,
-        data: { ...seqData, [keyYear]: nextYearSeq, seqGlobal: nextGlobalSeq },
-    };
+            const currentGlobalSeq = Number(seqData.seqGlobal || 0);
+            const nextGlobalSeq = currentGlobalSeq + 1;
 
-    const saved = await withTimeout(
-        wixData.save(SEQ_COLLECTION, updated, { suppressAuth: true }),
-        CMS_TIMEOUT_MS,
-        "saveTicketSequence"
-    );
+            const { _createdDate, _updatedDate, _owner, ...safeSeqDoc } = seqDoc;
 
-    const savedData = saved && typeof saved.data === "object" && saved.data ? saved.data : {};
-    if (Number(savedData[keyYear]) !== nextYearSeq || Number(savedData.seqGlobal) !== nextGlobalSeq) {
-        throw createBookingError(ERROR_CODES.FISCAL_SIGN_FAIL, "Sequence persistence mismatch", {
-            traceId,
-            expectedYear: nextYearSeq,
-            expectedGlobal: nextGlobalSeq,
-        });
+            const updated = {
+                ...safeSeqDoc,
+                _id: SEQ_ID,
+                data: { ...seqData, [keyYear]: nextYearSeq, seqGlobal: nextGlobalSeq },
+            };
+
+            const saved = await withTimeout(
+                wixData.save(SEQ_COLLECTION, updated, { suppressAuth: true }),
+                CMS_TIMEOUT_MS,
+                "saveTicketSequence"
+            );
+
+            const savedData = saved && typeof saved.data === "object" && saved.data ? saved.data : {};
+            if (Number(savedData[keyYear]) !== nextYearSeq || Number(savedData.seqGlobal) !== nextGlobalSeq) {
+                throw createBookingError(ERROR_CODES.FISCAL_SIGN_FAIL, "Sequence persistence mismatch", {
+                    traceId,
+                    expectedYear: nextYearSeq,
+                    expectedGlobal: nextGlobalSeq,
+                });
+            }
+
+            return { nextYearSeq, nextGlobalSeq };
+        }, 5, 250);
+    } finally {
+        await _unlockSlotKey(FISCAL_SEQUENCE_MUTEX_KEY, lockOwnerId).catch(() => {});
     }
-
-    return { nextYearSeq, nextGlobalSeq };
 }
 
 async function _getUltimoHashYSecuencia() {
     const res = await withTimeout(
-        wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA).descending("seqGlobal").limit(1).find({ suppressAuth: true }),
+        wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA)
+            .descending("seqGlobal")
+            .limit(1)
+            .find({ suppressAuth: true, consistentRead: true }),
         CMS_TIMEOUT_MS,
         "_getUltimoHashYSecuencia"
     );
@@ -213,14 +235,22 @@ async function _getAllDailyMovements(diaKey, options = {}) {
 
     query = query.limit(1000);
 
-    let res = await withTimeout(query.find({ suppressAuth: true }), CMS_TIMEOUT_MS, "queryDailyMovements_p1");
+    let res = await withTimeout(
+        query.find({ suppressAuth: true, consistentRead: true }),
+        CMS_TIMEOUT_MS,
+        "queryDailyMovements_p1"
+    );
     allItems = allItems.concat(res.items || []);
 
     let page = 2;
     const maxPages = Number(SDK_CONFIG?.JOBS?.FISCAL_DAILY_MAX_PAGES) || 10;
 
     while (res.hasNext() && page <= maxPages) {
-        res = await withTimeout(res.next(), CMS_TIMEOUT_MS, `queryDailyMovements_p${page}`);
+        res = await withTimeout(
+            res.next({ suppressAuth: true, consistentRead: true }),
+            CMS_TIMEOUT_MS,
+            `queryDailyMovements_p${page}`
+        );
         allItems = allItems.concat(res.items || []);
         page++;
     }
@@ -271,36 +301,38 @@ async function _upsertCurrentCashProjection(diaKey, options = {}) {
     const day = String(diaKey || "").trim();
     if (!day) return null;
 
-    const now = new Date();
-    const [items, current] = await Promise.all([
-        _getAllDailyMovements(day),
-        withTimeout(
-            wixData.get(COLLECTIONS.CAJA_ACTUAL, "CAJA_PRINCIPAL", { suppressAuth: true }).catch(() => null),
-            CMS_TIMEOUT_MS,
-            "getCurrentCashProjection"
-        ),
-    ]);
-    const projection = _buildCashierProjection(items);
-    const isSameDay = String(current?.diaKey || "") === day;
-    const keepClosed = isSameDay && _isClosedCajaState(current?.estado) && !options.closed;
-    const { _createdDate, _updatedDate, _owner, ...safeCurrent } = current || {};
-    const doc = {
-        ...safeCurrent,
-        _id: "CAJA_PRINCIPAL",
-        diaKey: day,
-        ...projection,
-        estado: (options.closed || keepClosed) ? CAJA_STATUS.CLOSED : CAJA_STATUS.OPEN,
-        fechaApertura: isSameDay && current?.fechaApertura ? current.fechaApertura : now,
-        fechaCierre: options.closed ? now : (keepClosed ? current?.fechaCierre || null : null),
-        ultimaActualizacion: now,
-        fechaActualizacion: now,
-    };
+    return await _executeWithRetry(async () => {
+        const now = new Date();
+        const [items, current] = await Promise.all([
+            _getAllDailyMovements(day),
+            withTimeout(
+                wixData.get(COLLECTIONS.CAJA_ACTUAL, "CAJA_PRINCIPAL", { suppressAuth: true, consistentRead: true }).catch(() => null),
+                CMS_TIMEOUT_MS,
+                "getCurrentCashProjection"
+            ),
+        ]);
+        const projection = _buildCashierProjection(items);
+        const isSameDay = String(current?.diaKey || "") === day;
+        const keepClosed = isSameDay && _isClosedCajaState(current?.estado) && !options.closed;
+        const { _createdDate, _updatedDate, _owner, ...safeCurrent } = current || {};
+        const doc = {
+            ...safeCurrent,
+            _id: "CAJA_PRINCIPAL",
+            diaKey: day,
+            ...projection,
+            estado: (options.closed || keepClosed) ? CAJA_STATUS.CLOSED : CAJA_STATUS.OPEN,
+            fechaApertura: isSameDay && current?.fechaApertura ? current.fechaApertura : now,
+            fechaCierre: options.closed ? now : (keepClosed ? current?.fechaCierre || null : null),
+            ultimaActualizacion: now,
+            fechaActualizacion: now,
+        };
 
-    const operation = current ?
-        wixData.update(COLLECTIONS.CAJA_ACTUAL, doc, { suppressAuth: true }) :
-        wixData.insert(COLLECTIONS.CAJA_ACTUAL, doc, { suppressAuth: true });
+        const operation = current ?
+            wixData.update(COLLECTIONS.CAJA_ACTUAL, doc, { suppressAuth: true }) :
+            wixData.insert(COLLECTIONS.CAJA_ACTUAL, doc, { suppressAuth: true });
 
-    return await withTimeout(operation, CMS_TIMEOUT_MS, "upsertCurrentCashProjection");
+        return await withTimeout(operation, CMS_TIMEOUT_MS, "upsertCurrentCashProjection");
+    }, 3, 300);
 }
 
 function _mapFormaPagoToTipoMovimiento(formaPagoUpper, isRefund) {
@@ -370,7 +402,7 @@ async function _findCitaByBookingId(bookingId) {
         .query(COLLECTIONS.CITAS)
         .eq("bookingId", clean)
         .limit(1)
-        .find({ suppressAuth: true })
+        .find({ suppressAuth: true, consistentRead: true })
         .catch(() => null),
         CMS_TIMEOUT_MS,
         "findCitaByBookingIdInCajas"
@@ -379,9 +411,6 @@ async function _findCitaByBookingId(bookingId) {
     return q?.items?.[0] || null;
 }
 
-// =============================================================================
-// INTEGRITY VERIFICATION (prevHash + ticket sequence)
-// =============================================================================
 export async function _verifyIntegrityInternal(diaKey, options = {}) {
     const traceId = options.traceId || makeTraceId("verify-integrity");
     const fiscalKey = await _getCachedCashierSecret();
@@ -401,7 +430,7 @@ export async function _verifyIntegrityInternal(diaKey, options = {}) {
             .lt("seqGlobal", firstSeqGlobal)
             .descending("seqGlobal")
             .limit(1)
-            .find({ suppressAuth: true }),
+            .find({ suppressAuth: true, consistentRead: true }),
             CMS_TIMEOUT_MS,
             "verifyIntegrityGlobalPredecessor"
         );
@@ -411,13 +440,11 @@ export async function _verifyIntegrityInternal(diaKey, options = {}) {
     for (let i = 0; i < items.length; i++) {
         const m = items[i];
 
-        // 1) Global prevHash chain, including the predecessor from an earlier day.
         if (m.prevHash !== expectedPrevHash) {
             inconsistencies.push({ index: i, id: m._id, reason: "prevHash mismatch with global predecessor hashCadena" });
         }
         expectedPrevHash = m.hashCadena || "";
 
-        // 2) hash + signature
         const payloadCanonico = m.integrityPayloadVersion === "LEDGER_V2" ?
             _canonicalPayloadV2(m) :
             _canonicalPayload(m.prevHash, m.transactionId, m.tipoMovimiento, m.importeContable, m.formaPago);
@@ -428,7 +455,6 @@ export async function _verifyIntegrityInternal(diaKey, options = {}) {
         if (m.hashCadena !== computedHashCadena) inconsistencies.push({ index: i, id: m._id, reason: "hashCadena mismatch" });
         if (m.firmaDigital !== firmaExpectedFull) inconsistencies.push({ index: i, id: m._id, reason: "signature mismatch" });
 
-        // 3) ticket sequence
         if (m.numTicketFactura && typeof m.numTicketFactura === "string") {
             const parts = m.numTicketFactura.split("-");
             if (parts.length === 3) {
@@ -479,9 +505,6 @@ export async function _verifyIntegrityInternal(diaKey, options = {}) {
     return { integrityOk, inconsistencies, totalVerified: items.length };
 }
 
-// =============================================================================
-// MOVEMENT REGISTRATION
-// =============================================================================
 export async function registerBookingPayment(bookingId, amount, paymentMethod, options = {}) {
     const traceId = options.traceId || makeTraceId("ledger");
     const lockOwnerId = String(traceId);
@@ -500,7 +523,6 @@ export async function registerBookingPayment(bookingId, amount, paymentMethod, o
 
         await _getCachedCashierSecret();
 
-        // Acquire global mutex
         const lockResult = await _lockSlotKeyOrFail(LEDGER_MUTEX_KEY, lockOwnerId, LEDGER_MUTEX_TTL_MS);
         if (!lockResult?.ok) {
             throw createBookingError(ERROR_CODES.TOKEN_BUSY, "Ledger write busy, retry later", { traceId });
@@ -563,7 +585,6 @@ export async function registerBookingPayment(bookingId, amount, paymentMethod, o
             const recordId = `MOV_${_normalizeIdPart(diaKey, 10)}_${_normalizeIdPart(tipoMov, 15)}_${_normalizeIdPart(transId, 120)}`;
             const resourceId = options.resourceId ? _normalizeIdPart(options.resourceId, 80) : null;
 
-            // Defensive post-mutex check
             const checkHash = await _getUltimoHashYSecuencia();
             if (checkHash.ultimoHash !== ultimoHash) {
                 throw createBookingError(ERROR_CODES.FISCAL_SIGN_FAIL, "Ledger hash changed during mutex hold", {
@@ -573,9 +594,8 @@ export async function registerBookingPayment(bookingId, amount, paymentMethod, o
                 });
             }
 
-            // Idempotency by recordId
             const existing = await withTimeout(
-                wixData.get(COLLECTIONS.MOVIMIENTOS_CAJA, recordId, { suppressAuth: true }).catch(() => null),
+                wixData.get(COLLECTIONS.MOVIMIENTOS_CAJA, recordId, { suppressAuth: true, consistentRead: true }).catch(() => null),
                 CMS_TIMEOUT_MS,
                 "getExistingRecord"
             );
@@ -625,7 +645,6 @@ export async function registerBookingPayment(bookingId, amount, paymentMethod, o
                 "registerBookingPaymentInsert"
             );
 
-            // Early guard: project to accounting only when explicitly enabled
             if (SDK_CONFIG?.ACCOUNTING?.ENABLED === true) {
                 try {
                     const accounting = await projectLedgerMovementToAccounting(result);
@@ -659,7 +678,6 @@ export async function registerBookingPayment(bookingId, amount, paymentMethod, o
                 log.warn("Ledger entry recorded without configured fiscal issuer NIF", { recordId, traceId });
             }
 
-            // Early guard: enqueue to M365 only when explicitly enabled
             if (SDK_CONFIG?.M365?.ENABLED === true) {
                 try {
                     await enqueueM365LedgerRecord(result, traceId);
@@ -694,9 +712,6 @@ export async function registerBookingPayment(bookingId, amount, paymentMethod, o
     }
 }
 
-// =============================================================================
-// INTERNAL Z CLOSING FOR SCHEDULED JOBS
-// =============================================================================
 function _buildZClosingSummary(diaKey, movements, integrity, source) {
     const items = [...(movements || [])].sort((a, b) => Number(a?.seqGlobal || 0) - Number(b?.seqGlobal || 0));
     const totalsByPayment = { efectivo: 0, tarjeta: 0, bizum: 0, online: 0 };
@@ -766,21 +781,21 @@ function _buildZClosingSummary(diaKey, movements, integrity, source) {
 }
 
 export async function _registerZClosingInternal(diaKey, options = {}) {
-    const traceId = options.traceId || makeTraceId('z-closing-cron');
+    const traceId = options.traceId || makeTraceId("z-closing-cron");
     try {
-        if (!diaKey) throw createBookingError(ERROR_CODES.INVALID_PAYLOAD, 'diaKey required', { traceId });
+        if (!diaKey) throw createBookingError(ERROR_CODES.INVALID_PAYLOAD, "diaKey required", { traceId });
         const zId = `Z_${String(diaKey)}`;
         const existingZ = await withTimeout(
-            wixData.query(COLLECTIONS.HISTORICO_CIERRES_Z).eq('_id', zId).limit(1).find({ suppressAuth: true }),
+            wixData.query(COLLECTIONS.HISTORICO_CIERRES_Z).eq("_id", zId).limit(1).find({ suppressAuth: true, consistentRead: true }),
             CMS_TIMEOUT_MS,
-            'checkExistingZInternal'
+            "checkExistingZInternal"
         );
         if (existingZ?.items?.length) {
-            return { status: 'SUCCESS', data: { ...existingZ.items[0], idempotent: true }, error: null };
+            return { status: "SUCCESS", data: { ...existingZ.items[0], idempotent: true }, error: null };
         }
         const integrity = await _verifyIntegrityInternal(diaKey, { traceId });
         if (!integrity?.integrityOk) {
-            throw createBookingError(ERROR_CODES.FISCAL_VIOLATION, 'Integrity violation in Z closing', { traceId });
+            throw createBookingError(ERROR_CODES.FISCAL_VIOLATION, "Integrity violation in Z closing", { traceId });
         }
         const items = await _getAllDailyMovements(diaKey, { ascendingCreated: true });
         const source = options.autoCron ? "CRON" : "ADMIN";
@@ -798,23 +813,20 @@ export async function _registerZClosingInternal(diaKey, options = {}) {
             fechaVerificacion: new Date(),
             hashCierre,
             firmaCierre,
-            traceId
+            traceId,
         };
         const result = await withTimeout(
             wixData.insert(COLLECTIONS.HISTORICO_CIERRES_Z, record, { suppressAuth: true }),
             CMS_TIMEOUT_MS,
-            'insertZClosingInternal'
+            "insertZClosingInternal"
         );
         await _upsertCurrentCashProjection(diaKey, { closed: true });
-        return { status: 'SUCCESS', data: result, error: null };
+        return { status: "SUCCESS", data: result, error: null };
     } catch (error) {
-        return { status: 'ERROR', data: null, error: _toPublicError(error, 'Z_CLOSING_FAIL') };
+        return { status: "ERROR", data: null, error: _toPublicError(error, "Z_CLOSING_FAIL") };
     }
 }
 
-// =============================================================================
-// DURABLE FISCAL RECOVERY
-// =============================================================================
 const FISCAL_RECOVERY_KIND = "FISCAL_LEDGER";
 const FISCAL_RECOVERY_MAX_RETRIES = Number(CONCURRENCY?.MAX_COMPENSATION_RETRIES) || 3;
 
@@ -823,7 +835,7 @@ async function _markCitasPaidAfterFiscalRecovery(bookingIds, orderId, traceId) {
     for (const bookingId of ids) {
         try {
             const res = await withTimeout(
-                wixData.query(COLLECTIONS.CITAS).eq("bookingId", bookingId).limit(1).find({ suppressAuth: true }),
+                wixData.query(COLLECTIONS.CITAS).eq("bookingId", bookingId).limit(1).find({ suppressAuth: true, consistentRead: true }),
                 CMS_TIMEOUT_MS,
                 "recoveryQueryCita"
             );
@@ -929,7 +941,7 @@ export async function processPendingFiscalRecoveries(options = {}) {
         const waitForOriginal = String(item.phase || "") === "WAIT_FOR_ORIGINAL_ORDER_LEDGER";
         if (waitForOriginal) {
             const originalTransactionId = `ORDER-${String(item.orderId || "").trim()}`;
-            const original = await wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA).eq("transactionId", originalTransactionId).limit(1).find({ suppressAuth: true }).catch(() => ({ items: [] }));
+            const original = await wixData.query(COLLECTIONS.MOVIMIENTOS_CAJA).eq("transactionId", originalTransactionId).limit(1).find({ suppressAuth: true, consistentRead: true }).catch(() => ({ items: [] }));
             if (!original?.items?.length) continue;
         }
 
@@ -981,9 +993,6 @@ export async function processPendingFiscalRecoveries(options = {}) {
     return { status: "SUCCESS", data: { completed, failed, scanned: result?.items?.length || 0 }, error: null };
 }
 
-// =============================================================================
-// PUBLIC WEB METHODS
-// =============================================================================
 export const registerManualTransaction = webMethod(Permissions.SiteMember, async (payload = {}) => {
     const traceId = payload.traceId || makeTraceId("manual-tx");
     try {
@@ -1013,14 +1022,14 @@ export const registerManualTransaction = webMethod(Permissions.SiteMember, async
 });
 
 export const registerXCount = webMethod(Permissions.SiteMember, async (diaKey, options = {}) => {
-    const traceId = options.traceId || makeTraceId('x-count');
+    const traceId = options.traceId || makeTraceId("x-count");
     try {
-        _rateLimitOrThrow('cajas.registerXCount', 'cashier', traceId);
+        _rateLimitOrThrow("cajas.registerXCount", "cashier", traceId);
         await requireCajero(traceId);
-        if (!diaKey) throw createBookingError(ERROR_CODES.INVALID_PAYLOAD, 'diaKey required', { traceId });
+        if (!diaKey) throw createBookingError(ERROR_CODES.INVALID_PAYLOAD, "diaKey required", { traceId });
         const metalicoCaja = Number(options.metalicoCaja);
         if (!Number.isFinite(metalicoCaja) || metalicoCaja < 0) {
-            throw createBookingError(ERROR_CODES.INVALID_PAYLOAD, 'metalicoCaja must be a non-negative number', { traceId });
+            throw createBookingError(ERROR_CODES.INVALID_PAYLOAD, "metalicoCaja must be a non-negative number", { traceId });
         }
         const movements = await _getAllDailyMovements(String(diaKey));
         const cashProjection = _buildCashierProjection(movements);
@@ -1035,16 +1044,16 @@ export const registerXCount = webMethod(Permissions.SiteMember, async (diaKey, o
             estadoCuadre: Math.abs(descuadre) < 0.01 ? "CUADRADO" : "DESCUADRE",
             fechaConteo: new Date(),
             fechaArqueo: new Date(),
-            traceId
+            traceId,
         };
         const result = await withTimeout(
             wixData.insert(COLLECTIONS.CONTEOS_X, record, { suppressAuth: true }),
             CMS_TIMEOUT_MS,
-            'insertXCount'
+            "insertXCount"
         );
-        return { status: 'SUCCESS', data: result, error: null };
+        return { status: "SUCCESS", data: result, error: null };
     } catch (error) {
-        return { status: 'ERROR', data: null, error: _toPublicError(error, 'X_COUNT_FAIL') };
+        return { status: "ERROR", data: null, error: _toPublicError(error, "X_COUNT_FAIL") };
     }
 });
 
@@ -1055,7 +1064,6 @@ export const registerZClosing = webMethod(Permissions.Admin, async (diaKey, opti
         await requireAdmin(traceId);
         if (!diaKey) throw createBookingError(ERROR_CODES.INVALID_PAYLOAD, "diaKey required", { traceId });
 
-        // The public and scheduled paths must create the same signed Z_V2 record.
         return await _registerZClosingInternal(String(diaKey), { traceId, autoCron: false });
     } catch (err) {
         return { status: "ERROR", data: null, error: _toPublicError(err, "Z_CLOSING_FAIL") };
