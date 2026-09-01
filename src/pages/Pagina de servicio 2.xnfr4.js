@@ -2,27 +2,27 @@
  * =============================================================================
  * MODULE: pages/servicio-2.js
  * VERSION: v21.0.2-canonical-service-widget-image-fallback
- * RESPONSIBILITY: Resolve Import2 service and connect the custom widget to
- * canonical calendar and services routes.
  * STANDARDS: G10 ASCII Strict.
+ *
  * HISTORIAL:
- * - v21.0.2-canonical-service-widget-image-fallback:
- *   Removes unsafe UI dependency, adds local configuration, validates context,
- *   preserves canonical serviceId and slugUrl, and sends a default image.
- * - v19.6.15-canonical-duration-context:
- *   Preserves canonical duracionTotal.
- * - v19.6.14-canonical-widget-service-context:
- *   Emits serviceId only.
- * - v19.6.10-widget-migration-context:
- *   Sends canonical service context to the HTML widget.
- * - v19.6.7-ready-only-context:
- *   Uses the widget READY handshake.
+ * - v21.0.2:
+ *   Removes the unsafe UI dependency, adds local configuration, validates the
+ *   canonical service context, preserves serviceId and slugUrl, and sends a
+ *   default SVG image to the HTML widget.
+ * - v19.6.15:
+ *   Preserves canonical duracionTotal with nullish fallbacks.
+ * - v19.6.14:
+ *   Emits serviceId only and removes legacy service aliases.
+ * - v19.6.10:
+ *   Sends canonical service context to the active HTML widget.
+ * - v19.6.7:
+ *   Uses the widget READY handshake before context delivery.
  * - v19.4.6:
- *   Validates local add-on IDs before navigation.
+ *   Validates local add-on IDs before calendar navigation.
  * - v19.4.4:
  *   Resolves Import2 by slugUrl first and serviceId second.
  * - v19.4.2:
- *   Adds service image fallback.
+ *   Adds a verified default service image fallback.
  * =============================================================================
  */
 
@@ -46,6 +46,25 @@ import {
 
 import { createWidgetBridge } from "public/widgetBridge";
 
+const DEFAULT_SERVICE_IMAGE_URL =
+  "data:image/svg+xml;charset=UTF-8," +
+  encodeURIComponent(`
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">
+      <rect width="1200" height="800" fill="#e9e2d9"/>
+      <circle cx="930" cy="170" r="210" fill="#d8bea0"/>
+      <rect x="105" y="180" width="530" height="450"
+        rx="30" fill="#f7f3ee"/>
+      <text x="160" y="420"
+        fill="#342b24"
+        font-family="Georgia, serif"
+        font-size="68">MARIAN</text>
+      <text x="160" y="500"
+        fill="#342b24"
+        font-family="Georgia, serif"
+        font-size="68">MADRID</text>
+    </svg>
+  `);
+
 const CONFIG = Object.freeze({
   HANDSHAKE_TIMEOUT_MS: 10000,
   CONTEXT_TIMEOUT_MS: 60000,
@@ -55,15 +74,7 @@ const CONFIG = Object.freeze({
   DEFAULT_DURATION_MINUTES: 30,
   DEFAULT_LOCATION: "Marian Madrid",
   DEFAULT_CURRENCY: "EUR",
-  DEFAULT_SERVICE_IMAGE_URL:
-    "data:image/svg+xml;charset=UTF-8," +
-    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 800'>" +
-    "<rect width='1200' height='800' fill='%23e9e2d9'/>" +
-    "<circle cx='930' cy='170' r='210' fill='%23d8bea0'/>" +
-    "<rect x='105' y='180' width='530' height='450' rx='30' fill='%23f7f3ee'/>" +
-    "<text x='160' y='420' fill='%23342b24' font-family='Georgia' font-size='68'>MARIAN</text>" +
-    "<text x='160' y='500' fill='%23342b24' font-family='Georgia' font-size='68'>MADRID</text>" +
-    "</svg>"
+  DEFAULT_SERVICE_IMAGE_URL
 });
 
 function _isGuid(value) {
@@ -79,6 +90,14 @@ function _isSlug(value) {
 function _safeNumber(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function _safeMetadata(value) {
+  return value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+    ? value
+    : {};
 }
 
 async function _resolveServiceLookup() {
@@ -215,10 +234,10 @@ function _showError(message) {
 }
 
 function _sanitizeRequestedAddonIds(rawAddons, resolvedService) {
-  const catalog = Array.isArray(
-    resolvedService?.metadata?.addons
-  )
-    ? resolvedService.metadata.addons
+  const metadata = _safeMetadata(resolvedService?.metadata);
+
+  const catalog = Array.isArray(metadata.addons)
+    ? metadata.addons
     : [];
 
   const allowedIds = new Set(
@@ -231,8 +250,8 @@ function _sanitizeRequestedAddonIds(rawAddons, resolvedService) {
     new Set(
       (Array.isArray(rawAddons) ? rawAddons : [])
         .map((addon) => {
-          if (typeof addon === "object") {
-            return _safeTrim(addon?.addonId);
+          if (addon && typeof addon === "object") {
+            return _safeTrim(addon.addonId);
           }
 
           return _safeTrim(addon);
@@ -264,17 +283,19 @@ function _goToCalendar(slugUrl, serviceId, addonIds = []) {
     URLS?.CALENDARIO_2 ||
     "/booking-calendar/calendario-2";
 
-  const params = new URLSearchParams({
-    slugUrl: canonicalSlugUrl,
-    serviceId: canonicalGuid,
-    referral: "service2"
-  });
+  const query = [
+    `slugUrl=${encodeURIComponent(canonicalSlugUrl)}`,
+    `serviceId=${encodeURIComponent(canonicalGuid)}`,
+    `referral=service2`
+  ];
 
   if (addonIds.length > 0) {
-    params.set("addonIds", addonIds.join(","));
+    query.push(
+      `addonIds=${encodeURIComponent(addonIds.join(","))}`
+    );
   }
 
-  wixLocation.to(`${base}?${params.toString()}`);
+  wixLocation.to(`${base}?${query.join("&")}`);
 }
 
 function _goToServices() {
@@ -284,15 +305,9 @@ function _goToServices() {
 }
 
 function _buildContext(data, traceId) {
-  const metadata =
-    data?.metadata &&
-    typeof data.metadata === "object" &&
-    !Array.isArray(data.metadata)
-      ? data.metadata
-      : {};
-
-  const serviceId = _isGuid(data.serviceId);
-  const slugUrl = _isSlug(data.slugUrl);
+  const metadata = _safeMetadata(data?.metadata);
+  const serviceId = _isGuid(data?.serviceId);
+  const slugUrl = _isSlug(data?.slugUrl);
 
   if (!serviceId || !slugUrl) {
     throw new Error("Invalid canonical service context");
@@ -352,20 +367,27 @@ function _buildContext(data, traceId) {
       precio,
       duracionTotal,
       localizacion,
+
       resumenCorto:
         _safeTrim(metadata.resumenCorto) ||
         "Marian Madrid",
+
       descripcionLarga:
         _safeTrim(metadata.descripcionLarga) ||
         "Detalles no disponibles.",
+
       recomendacionProductoRef:
         _safeTrim(metadata.recomendacionProductoRef),
+
       recomendacionProductoRef2:
         _safeTrim(metadata.recomendacionProductoRef2),
+
       addons,
+
       addonsPrecio: addons.map((addon) =>
         _safeNumber(addon?.precio, 0)
       ),
+
       imageUrl,
 
       pricing: {
@@ -493,11 +515,3 @@ $w.onReady(async function () {
     );
   }
 });
-```
-
-El widget HTML debe conservar:
-
-```js
-applyImage(metadata.imageUrl, title);
-
-La imagen predeterminada se utiliza cuando `metadata.imageUrl` está vacío o no existe.
