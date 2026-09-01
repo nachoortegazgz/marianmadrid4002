@@ -1,29 +1,12 @@
-/**
- * =============================================================================
- * MODULE: backend/booking/bookingCore.js
- * VERSION: v20.0.0-resilient-transaction-retry
- * RESPONSIBILITY: Elevated proxies, slot sanitization, mutex locks, atomic
- * transactions, persistence, and error handling.
- * STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
- * HISTORIAL:
- * - v20.0.0-resilient-transaction-retry: Allows safe retry of previously failed
- *   transactions on the same slot without artificial lockout, preserving mutex guards.
- * - v19.6.14-addon-contract-cleanup: Removes the unused legacy add-on normalizer that emitted id aliases.
- * - v19.6.8-current-bookings-sdk: Uses the current @wix/bookings SDK package for Writer V2 operations.
- * - v19.6.7-writer-slot-native-id: Emits Writer V2 resource and location identifiers as native _id fields.
- * - v19.6.6-transaction-observability: Logs best-effort transaction failure persistence errors with safe identifiers.
- * - v19.6.3-prioritized-reliability-refactor: Removes duplicated catalog and slot paths, restores Codegem fixes, and hardens persistence.
- * - v19.6.2-serviceid-linkfases-contract: Uses serviceId and derives F2 only from Import2.linkFases.
- * - v19.5.8-dual-cache-miss-query: Reads dual cache misses through a bounded query to avoid expected not-found noise.
- * - v19.5.5-native-slot-schedule-priority: Uses scheduleId from the exact Time Slots V2 response before controlled MAPA_STAFF fallback.
- * - v19.5.4-writer-location-context: Uses the Bookings Writer V2 location enum from the dedicated SSOT context.
- * - v19.5.3: Replaces fixed duplicate-transaction polling with bounded SSOT backoff and jitter.
- * - v19.4.4: Replaced the deprecated staff SDK lookup with MAPA_STAFF scheduleId SSOT and persisted serviceId.
- * - v19.2.0-concurrency-hardened: Uses insert-only lock acquisition, consistent reads, and payload-hash idempotency.
- * - v19.1.2-v2-contract-aligned: Removed duplicate payment-status metadata keys.
- * - v19.1.1-v2-contract-aligned: Normalized Slot V2 and checkout URL contracts.
- * =============================================================================
- */
+/*
+=============================================================================
+MODULE: backend/booking/bookingCore.js
+VERSION: marianmadrid4002 (v21.1.0-LTS-remediated)
+RESPONSIBILITY: Elevated proxies, slot sanitization, mutex locks, atomic
+            transactions, persistence, centralized cita updates, and error handling.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
 
 import { bookings } from "@wix/bookings";
 import { checkout } from "wix-ecom-backend";
@@ -36,6 +19,10 @@ import {
     getMadridLocalStringNoZ,
     makeTraceId,
     _toDateSafe,
+    _roundMoney,
+    _sumAddons,
+    _executeWithRetry,
+    withTimeout,
 } from "public/mmUtils";
 import {
     COLLECTIONS,
@@ -51,10 +38,8 @@ export const logger = {
 };
 
 const log = logger;
+const API_TIMEOUT_MS = SDK_CONFIG?.TIMEOUTS?.API_MS || 15000;
 
-// -----------------------------------------------------------------------------
-// Error codes (exported; used by cajas.web.js and others)
-// -----------------------------------------------------------------------------
 export const ERROR_CODES = Object.freeze({
     INVALID_PAYLOAD: "INVALID_PAYLOAD",
     TOKEN_BUSY: "TOKEN_BUSY",
@@ -69,9 +54,6 @@ export const ERROR_CODES = Object.freeze({
     RATE_LIMITED: "RATE_LIMITED",
 });
 
-// -----------------------------------------------------------------------------
-// Elevated proxies (Bookings V2 + eCom backend)
-// -----------------------------------------------------------------------------
 export const createBookingElevated = elevate(bookings.createBooking);
 export const cancelBookingElevated = elevate(bookings.cancelBooking);
 export const confirmOrDeclineBookingElevated = elevate(bookings.confirmOrDeclineBooking);
@@ -80,9 +62,6 @@ export const rescheduleBookingElevated = elevate(bookings.rescheduleBooking);
 export const createCheckoutElevated = elevate(checkout.createCheckout);
 export const getCheckoutUrlElevated = elevate(checkout.getCheckoutUrl);
 
-// -----------------------------------------------------------------------------
-// Writer V2 slot projection
-// -----------------------------------------------------------------------------
 function _toUtcDateFromAvailability(value) {
     if (value instanceof Date) return isNaN(value.getTime()) ? null : value;
     const raw = _safeTrim(value);
@@ -94,11 +73,6 @@ function _toUtcDateFromAvailability(value) {
     return getUtcDateFromMadridLocal(raw);
 }
 
-/**
- * Projects the exact revalidated Time Slots V2 response into the Writer V2
- * appointment slot contract. It never derives duration, scheduleId, or location
- * from staff settings. The selected resource is the only explicit assignment.
- */
 export function _projectWriterSlotFromAvailability(slot, resourceId, expectedServiceId) {
     const s = slot && typeof slot === "object" ? slot : null;
     if (!s) return null;
@@ -138,9 +112,6 @@ export function _projectWriterSlotFromAvailability(slot, resourceId, expectedSer
     };
 }
 
-// -----------------------------------------------------------------------------
-// Checkout URL helper (stable)
-// -----------------------------------------------------------------------------
 export function _extractCheckoutId(checkoutSession) {
     return checkoutSession?.checkout?._id || checkoutSession?._id || null;
 }
@@ -163,9 +134,6 @@ export async function getCheckoutUrlSafe(checkoutSessionOrId) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Mutex locks (stable _id derived from slotKey)
-// -----------------------------------------------------------------------------
 const MUTEX_TTL_MS = Number(CONCURRENCY?.MUTEX_TTL_MS) || 120000;
 const LOCKS_COL = COLLECTIONS.LOCKS;
 
@@ -219,7 +187,6 @@ async function _reclaimExpiredLock(slotKey, lockOwnerId, ttlMs, observed) {
         return { ok: false, message: "LOCK_HELD_BY_ANOTHER_OWNER" };
     }
 
-    // Re-read before removal so a renewed or replaced lease is never removed.
     const current = await _getLock(slotKey);
     const currentExpiry = _toDateSafe(current?.expiresAt);
     if (!current || current.traceId !== observed.traceId || !currentExpiry || currentExpiry.getTime() >= Date.now()) {
@@ -227,18 +194,20 @@ async function _reclaimExpiredLock(slotKey, lockOwnerId, ttlMs, observed) {
     }
 
     try {
-        await wixData.remove(LOCKS_COL, current._id, { suppressAuth: true });
-    } catch (error) {
-        return { ok: false, message: "LOCK_RECLAIM_RACE" };
-    }
-
-    try {
-        await wixData.insert(LOCKS_COL, _buildLockDocument(slotKey, lockOwnerId, ttlMs, current), { suppressAuth: true });
+        const lockDocument = _buildLockDocument(slotKey, lockOwnerId, ttlMs, current);
+        await wixData.update(LOCKS_COL, lockDocument, { suppressAuth: true });
         return { ok: true, reclaimed: true };
     } catch (error) {
-        if (_isDuplicateItemError(error)) return { ok: false, message: "LOCK_RECLAIM_RACE" };
-        log.error("Expired lock reclaim failed", { slotKey, lockOwnerId, error: error?.message });
-        return { ok: false, message: "LOCK_RECLAIM_FAILED" };
+        log.warn("Direct update lock reclaim failed, trying fallback", { slotKey, lockOwnerId, error: error?.message });
+        try {
+            await wixData.remove(LOCKS_COL, current._id, { suppressAuth: true });
+            await wixData.insert(LOCKS_COL, _buildLockDocument(slotKey, lockOwnerId, ttlMs, current), { suppressAuth: true });
+            return { ok: true, reclaimed: true };
+        } catch (removeErr) {
+            if (_isDuplicateItemError(removeErr)) return { ok: false, message: "LOCK_RECLAIM_RACE" };
+            log.error("Expired lock reclaim failed", { slotKey, lockOwnerId, error: removeErr?.message });
+            return { ok: false, message: "LOCK_RECLAIM_FAILED" };
+        }
     }
 }
 
@@ -305,9 +274,6 @@ export async function _renewLock(slotKey, lockOwnerId, ttlMs) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Dual cache
-// -----------------------------------------------------------------------------
 const DUAL_CACHE_COL = COLLECTIONS.DUAL_CACHE;
 
 export async function _getDualPairFromCache(pairToken, traceId) {
@@ -334,9 +300,6 @@ export async function _getDualPairFromCache(pairToken, traceId) {
     return item;
 }
 
-// -----------------------------------------------------------------------------
-// Slot keys
-// -----------------------------------------------------------------------------
 export function _generateSlotKey(serviceId, resourceId, startDate, endDate) {
     const startUtc = startDate instanceof Date ? startDate : getUtcDateFromMadridLocal(startDate);
     const endUtc = endDate instanceof Date ? endDate : getUtcDateFromMadridLocal(endDate);
@@ -356,9 +319,6 @@ export function _buildLockKeys(phases, resourceId) {
     return Array.from(new Set(keys)).sort();
 }
 
-// -----------------------------------------------------------------------------
-// Transactions (idempotency)
-// -----------------------------------------------------------------------------
 export const TRANSACTIONS_COL = COLLECTIONS.TRANSACTIONS;
 const TRANSACTION_POLL_BASE_MS = Number(CONCURRENCY?.TRANSACTION_POLL_BASE_MS) || 250;
 const TRANSACTION_MAX_WAIT_MS = Number(CONCURRENCY?.TRANSACTION_MAX_WAIT_MS) || 3000;
@@ -496,9 +456,6 @@ export async function _failTransaction(pairToken, errorMessage) {
     });
 }
 
-// -----------------------------------------------------------------------------
-// Persist booking (CMS) - CitasF2 aligned fields
-// -----------------------------------------------------------------------------
 const CITAS_COL = COLLECTIONS.CITAS;
 const CITA_STATUS_BY_PAYMENT = Object.freeze({
     UNPAID: "CONFIRMED",
@@ -514,6 +471,39 @@ function _getCitaStatusFromPayment(statusPago) {
     const status = CITA_STATUS_BY_PAYMENT[payment];
     if (!status) throw new Error(`Unsupported payment status: ${payment || "EMPTY"}`);
     return status;
+}
+
+export async function _updateCitaSafe(bookingId, patchFn, traceId, label = "updateCitaSafe") {
+    const cleanId = String(bookingId || "").trim();
+    if (!cleanId || cleanId === "unknown") return null;
+
+    return await _executeWithRetry(async () => {
+        const citaRes = await withTimeout(
+            wixData.query(CITAS_COL)
+                .eq("bookingId", cleanId)
+                .limit(1)
+                .find({ suppressAuth: true, consistentRead: true }),
+            API_TIMEOUT_MS,
+            `${label}_query`
+        );
+        const cita = citaRes?.items?.[0];
+        if (!cita) return null;
+
+        const patched = patchFn(cita);
+        if (!patched) return cita;
+
+        const { _createdDate, _updatedDate, _owner, ...safeCita } = patched;
+        const updated = {
+            ...safeCita,
+            fechaActualizacion: new Date(),
+        };
+
+        return await withTimeout(
+            wixData.update(CITAS_COL, updated, { suppressAuth: true }),
+            API_TIMEOUT_MS,
+            `${label}_persist`
+        );
+    }, 3, 300);
 }
 
 export async function _persistBooking(params, traceId) {
@@ -565,19 +555,14 @@ export async function _persistBooking(params, traceId) {
         endDateLocal: endLocal,
         fechaYmdMadrid,
         tipo: tipo || "simple",
-
-        // CitasF2 fields
         status: statusCita,
         statusPago: metaPago,
-
-        // Keep meta for saga/debug + compatibility inside meta only
         meta: {
             ...(meta || {}),
             status: statusCita,
             estado: statusCita,
             statusPago: metaPago,
         },
-
         contactDetails: contactDetails || {},
         traceId: String(traceId || ""),
         fechaCreacion: now,
@@ -599,14 +584,8 @@ export async function _persistBooking(params, traceId) {
     }
 }
 
-export function _sumAddons(addons) {
-    if (!Array.isArray(addons)) return 0;
-    return addons.reduce((acc, a) => acc + Number(a.precio || a.price || 0), 0);
-}
+export { _sumAddons };
 
-// -----------------------------------------------------------------------------
-// Errors + PII sanitization
-// -----------------------------------------------------------------------------
 export class BookingError extends Error {
     constructor(code, message, details = {}) {
         super(String(message || "Unknown error"));

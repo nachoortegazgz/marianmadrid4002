@@ -1,15 +1,15 @@
 /*
 =============================================================================
 MODULE: backend/booking/bookingSaga.js
-VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-booking-saga-hardened)
+VERSION: marianmadrid4002 (v21.1.0-LTS-remediated)
 RESPONSIBILITY: Transactional Saga Orchestrator for simple and dual bookings.
-            Includes resilient heartbeat lock management, two-phase rollback,
-            and automatic pending compensation registration.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 =============================================================================
 */
 
 import wixData from "wix-data";
+import { extendedBookings } from "@wix/bookings";
+import { elevate } from "wix-auth";
 
 import {
     BOOKINGS_ADDON_CONFIG,
@@ -27,7 +27,6 @@ import {
     withTimeout,
     _isValidEmail,
     _maskEmail,
-    _roundMoney,
     _sumAddons,
     _extractRelationalId,
 } from "public/mmUtils";
@@ -78,12 +77,7 @@ const API_TIMEOUT_MS = SDK_CONFIG?.TIMEOUTS?.API_MS || 15000;
 const HEARTBEAT_MS = CONCURRENCY?.HEARTBEAT_MS || 15000;
 const LOCK_TTL_MS = Number(CONCURRENCY?.MUTEX_TTL_MS) || 120000;
 
-function _stopHeartbeat(intervalRef) {
-    if (intervalRef) {
-        clearInterval(intervalRef);
-    }
-    return null;
-}
+const queryExtendedBookingsElevated = elevate(extendedBookings.queryExtendedBookings);
 
 function _buildNativeBookedAddOns(addonsNorm) {
     const selected = Array.isArray(addonsNorm) ? addonsNorm : [];
@@ -142,6 +136,42 @@ async function _bestEffortUnlockAll(lockKeys, lockOwnerId, traceId) {
         if (!result?.ok && !result?.missing && !result?.skipped) {
             log.warn("bestEffortUnlockAll failed", { traceId, slotKey: key, message: result?.error?.message || result?.reason || "UNKNOWN" });
         }
+    }
+}
+
+async function _lookupExistingBookingAfterTimeout(serviceId, slotStartUtc, email, traceId) {
+    try {
+        if (!serviceId || !slotStartUtc || !email) return null;
+        const res = await withTimeout(
+            queryExtendedBookingsElevated({
+                filter: {
+                    "bookedEntity.slot.serviceId": String(serviceId),
+                    "contactDetails.email": String(email).toLowerCase(),
+                    status: { $ne: "CANCELED" },
+                },
+                cursorPaging: { limit: 5 },
+            }),
+            API_TIMEOUT_MS,
+            "queryExtendedBookingsAfterTimeout"
+        ).catch(() => null);
+
+        const items = Array.isArray(res?.extendedBookings) ? res.extendedBookings : (Array.isArray(res?.items) ? res.items : []);
+        for (const item of items) {
+            const booking = item?.booking || item;
+            const bookingStartDate = booking?.bookedEntity?.slot?.startDate ? new Date(booking.bookedEntity.slot.startDate) : null;
+            if (bookingStartDate && Math.abs(bookingStartDate.getTime() - slotStartUtc.getTime()) < 1000) {
+                const bId = booking?._id || booking?.id;
+                const rev = Number(booking?.revision || 1);
+                if (bId) {
+                    log.info("Recovered existing booking after timeout", { traceId, bookingId: bId, revision: rev });
+                    return { bookingId: bId, revision: rev };
+                }
+            }
+        }
+        return null;
+    } catch (err) {
+        log.warn("Lookup after timeout failed", { traceId, error: err?.message });
+        return null;
     }
 }
 
@@ -587,18 +617,18 @@ export async function executeBookingSaga(unsafePayload) {
                             acquiredKeys.push(key);
                         }
 
-                        if (!heartbeatInterval && lockKeys.length > 0) {
+                        if (!heartbeatInterval) {
                             heartbeatInterval = setInterval(() => {
                                 Promise.all(lockKeys.map((key) => _renewLock(key, lockOwnerId, LOCK_TTL_MS)))
                                     .then((results) => {
                                         if (results.some((result) => !result?.ok)) {
                                             lockLeaseLost = true;
-                                            log.error("Lock lease lost during booking saga renewal", { traceId, lockOwnerId });
+                                            log.error("Lock lease lost during booking saga", { traceId, lockOwnerId });
                                         }
                                     })
                                     .catch((error) => {
                                         lockLeaseLost = true;
-                                        log.error("Lock heartbeat renewal exception", { traceId, lockOwnerId, message: error?.message });
+                                        log.error("Lock heartbeat failed", { traceId, lockOwnerId, message: error?.message });
                                     });
                             }, HEARTBEAT_MS);
                         }
@@ -606,7 +636,10 @@ export async function executeBookingSaga(unsafePayload) {
                         return { ok: true };
                     },
                     async () => {
-                        heartbeatInterval = _stopHeartbeat(heartbeatInterval);
+                        if (heartbeatInterval) {
+                            clearInterval(heartbeatInterval);
+                            heartbeatInterval = null;
+                        }
                         await _bestEffortUnlockAll(lockKeys, lockOwnerId, traceId);
                     }
             ),
@@ -688,16 +721,20 @@ export async function executeBookingSaga(unsafePayload) {
                             if (!slotForApi) throw new Error("BOOKING_SLOT_V2_INVALID");
 
                             const phaseNativeBookedAddOns = phaseKey === "F1" ? nativeBookedAddOns : [];
-                            const res = await _executeWithRetry(
-                                () =>
-                                withTimeout(
-                                    createBookingElevated({
-                                        bookedEntity: { slot: slotForApi },
-                                        contactDetails,
-                                        totalParticipants: 1,
-                                        ...(phaseNativeBookedAddOns.length > 0 ? { bookedAddOns: phaseNativeBookedAddOns } : {}),
-                                        ...(isOnlinePaymentRequested ? { selectedPaymentOption: "ONLINE" } : {}),
-                                    }, {
+                            const createPayload = {
+                                bookedEntity: { slot: slotForApi },
+                                contactDetails,
+                                totalParticipants: 1,
+                                ...(phaseNativeBookedAddOns.length > 0 ? { bookedAddOns: phaseNativeBookedAddOns } : {}),
+                                ...(isOnlinePaymentRequested ? { selectedPaymentOption: "ONLINE" } : {}),
+                            };
+
+                            let bId = null;
+                            let rev = 1;
+
+                            try {
+                                const res = await withTimeout(
+                                    createBookingElevated(createPayload, {
                                         flowControlSettings: {
                                             skipAvailabilityValidation: false,
                                             skipBusinessConfirmation: false,
@@ -706,13 +743,62 @@ export async function executeBookingSaga(unsafePayload) {
                                     }),
                                     API_TIMEOUT_MS,
                                     `createBooking_${phaseKey}`
-                                ),
-                                5,
-                                500
-                            );
+                                );
 
-                            const bId = res?.booking?._id || res?._id;
-                            const rev = Number(res?.booking?.revision || res?.revision || 1);
+                                bId = res?.booking?._id || res?._id;
+                                rev = Number(res?.booking?.revision || res?.revision || 1);
+                            } catch (error) {
+                                log.warn(`createBooking_${phaseKey} threw error or timeout. Checking if booking was created...`, {
+                                    phaseKey,
+                                    error: error?.message,
+                                    traceId,
+                                });
+
+                                const recovered = await _lookupExistingBookingAfterTimeout(
+                                    phaseServiceId,
+                                    p.pristineSlot.startDate,
+                                    email,
+                                    traceId
+                                );
+
+                                if (recovered && recovered.bookingId) {
+                                    bId = recovered.bookingId;
+                                    rev = recovered.revision;
+                                } else {
+                                    const retryRes = await withTimeout(
+                                        createBookingElevated(createPayload, {
+                                            flowControlSettings: {
+                                                skipAvailabilityValidation: false,
+                                                skipBusinessConfirmation: false,
+                                                skipSelectedPaymentOptionValidation: false,
+                                            },
+                                        }),
+                                        API_TIMEOUT_MS,
+                                        `createBooking_retry_${phaseKey}`
+                                    ).catch((retryErr) => {
+                                        log.error(`createBooking_retry_${phaseKey} failed`, { error: retryErr?.message, traceId });
+                                        return null;
+                                    });
+
+                                    bId = retryRes?.booking?._id || retryRes?._id;
+                                    rev = Number(retryRes?.booking?.revision || retryRes?.revision || 1);
+
+                                    if (!bId) {
+                                        const secondRecovery = await _lookupExistingBookingAfterTimeout(
+                                            phaseServiceId,
+                                            p.pristineSlot.startDate,
+                                            email,
+                                            traceId
+                                        );
+                                        if (secondRecovery && secondRecovery.bookingId) {
+                                            bId = secondRecovery.bookingId;
+                                            rev = secondRecovery.revision;
+                                        } else {
+                                            throw error;
+                                        }
+                                    }
+                                }
+                            }
 
                             if (!bId) throw new Error(`Missing bookingId for ${phaseKey}`);
                             createdBookings.push({ bookingId: bId, revision: rev, phase: p });
@@ -883,7 +969,10 @@ export async function executeBookingSaga(unsafePayload) {
 
         await _completeTransaction(stableToken, resultData);
 
-        heartbeatInterval = _stopHeartbeat(heartbeatInterval);
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+        }
 
         await _bestEffortUnlockAll(lockKeys, lockOwnerId, traceId);
 
@@ -898,11 +987,17 @@ export async function executeBookingSaga(unsafePayload) {
 
         return { status: "SUCCESS", data: resultData, error: null };
     } catch (error) {
-        heartbeatInterval = _stopHeartbeat(heartbeatInterval);
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+        }
         if (lockKeys.length > 0 && lockOwnerId) await _bestEffortUnlockAll(lockKeys, lockOwnerId, traceId);
         if (pairToken) await _failTransaction(pairToken, error?.message || String(error)).catch(() => {});
         return _handleError(error, "executeBookingSaga", traceId, log);
     } finally {
-        heartbeatInterval = _stopHeartbeat(heartbeatInterval);
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+        }
     }
 }
