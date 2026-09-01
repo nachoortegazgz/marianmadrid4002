@@ -1,27 +1,11 @@
 /**
  * =============================================================================
  * MODULE: pages/calendario-2.js
- * VERSION: v20.0.0-canonical-calendar-payload
+ * VERSION: v21.0.0-canonical-calendar-duration-injected
  * RESPONSIBILITY: Interactive calendar page script aligned 100% with the custom
  * HTML widget (#html1). Handles availability, dual slots,
- * booking saga orchestration, and lightbox confirmation.
+ * booking saga orchestration, and authoritative lightbox confirmation.
  * STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
- * HISTORIAL:
- * - v20.0.0-canonical-calendar-payload: Emits canonical metadata image fallbacks and supports uiPairToken from nested metaCita or top-level payload.
- * - v19.6.7-ready-only-context: Waits for the HTML widget READY handshake before context delivery.
- * - v19.6.4-calendar-slugurl-contract: Resolves the canonical slugUrl query parameter before generic route fallbacks.
- * - v19.6.2-serviceid-linkfases-contract: Uses serviceId and derives F2 only from Import2.linkFases.
- * - v19.6.1-avail-action-contract: Echoes explicit days or slots action in availability responses and removes unreachable duplicate NAV handling.
- * - v19.5.2: Provides SSOT timezone/currency, canonical booking presentation values, and an enumerated privacy navigation target.
- * - v19.5.1: Uses backend-resolved staff labels in the professional selector and selection feedback.
- * - v19.4.9: Delivers the camelCase Import2 presentation context with SSOT image and location fallbacks.
- * - v19.4.7: Handles only enumerated widget NAV targets and builds routes from canonical service state.
- * - v19.4.6: Propagates selected Import2 add-on IDs for availability calculated by Bookings V2.
- * - v19.4.5: Removes calls to undefined staff helpers and relies on saga-confirmed staff data.
- * - v19.4.4: Removed getStaffCatalog and public service aliases; Import2 is staff SSOT and metadata.titulo is guaranteed.
- * - v19.4.1: Added canonical serviceId query fallback from reviewed version.
- * - v19.3.2: Resolve the Wix Bookings service from App Page Data before URL fallbacks.
- * - v19.2.0-v3-aligned-bookingsv2: Header standardized during V2 compliance review.
  * =============================================================================
  */
 
@@ -192,6 +176,7 @@ $w.onReady(async function () {
             currentServicePresentation = {
                 tituloServicio,
                 precio,
+                duracionTotal,
                 moneda: MONEY.DISPLAY_CURRENCY,
                 imageUrl,
                 addons: addons.map((addon) => ({
@@ -239,9 +224,7 @@ $w.onReady(async function () {
             const type = msg && msg.type ? String(msg.type).toUpperCase() : "";
             const messageId = msg && msg.messageId;
 
-            // -------------------------
             // Navigation
-            // -------------------------
             if (type === String(MESSAGE_TYPES.NAV).toUpperCase()) {
                 const target = String(msg?.payload?.target || "").trim().toUpperCase();
                 if (target === "SERVICIOS" || target === "BACK") {
@@ -264,9 +247,7 @@ $w.onReady(async function () {
                 return;
             }
 
-            // -------------------------
             // Availability
-            // -------------------------
             if (type === String(MESSAGE_TYPES.AVAIL).toUpperCase()) {
                 const p = (msg && msg.payload) || {};
                 const action = p.action;
@@ -321,9 +302,7 @@ $w.onReady(async function () {
                 return;
             }
 
-            // -------------------------
-            // Selection echo (UI)
-            // -------------------------
+            // Selection echo
             if (type === String(MESSAGE_TYPES.SELECT).toUpperCase()) {
                 const p = (msg && msg.payload) || {};
 
@@ -350,9 +329,7 @@ $w.onReady(async function () {
                 return;
             }
 
-            // -------------------------
             // Booking
-            // -------------------------
             if (type === String(MESSAGE_TYPES.BOOK).toUpperCase()) {
                 const p = (msg && msg.payload) || {};
 
@@ -418,6 +395,8 @@ $w.onReady(async function () {
                                 resourceFilterId: resourceId,
                                 extras: canonicalAddons.length > 0 ?
                                     canonicalAddons.map((addon) => addon.nombre).join(", ") : "Ninguno",
+                                duracion: Number(currentServicePresentation?.duracionTotal || 30),
+                                duracionTotal: Number(currentServicePresentation?.duracionTotal || 30),
                                 total: Number.isFinite(confirmedTotal) ? confirmedTotal : totalBilled,
                                 moneda: confirmation.moneda || currentServicePresentation?.moneda || MONEY.DISPLAY_CURRENCY,
                             });
