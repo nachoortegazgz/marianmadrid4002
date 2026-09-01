@@ -1,7 +1,7 @@
 /*
 =============================================================================
 MODULE: backend/internalConfig.js
-VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-unified-ssot)
+VERSION: marianmadrid4004 (v21.1.2-LTS-canonical-unified-ssot)
 RESPONSIBILITY: Single Source of Truth for all backend configuration:
             collection IDs, app IDs, SDK settings, concurrency limits,
             cache TTLs, enums, and feature flags.
@@ -119,7 +119,7 @@ export const SDK_CONFIG = Object.freeze({
         DUAL_CACHE_CLEANUP_LIMIT: 100,
         FISCAL_RECOVERY_BATCH_SIZE: 25,
         HEALTH_CHECK_QUERY_LIMIT: 100,
-        FISCAL_DAILY_MAX_PAGES: 10,
+        FISCAL_DAILY_MAX_PAGES: 50,
         BOOKINGS_SERVICE_SYNC_MAX_ATTEMPTS: 5,
         BOOKINGS_SERVICE_SYNC_BATCH_SIZE: 20,
         BOOKINGS_SERVICE_SYNC_BACKOFF_MS: 300000,
@@ -137,7 +137,7 @@ export const SDK_CONFIG = Object.freeze({
         HMAC_MAX_CLOCK_SKEW_SECONDS: 60,
         CORS_ALLOWED_ORIGINS: ["https://www.marianmadrid.es", "https://marianmadrid.es"],
     }),
-    M365: Object.freeze({ ENABLED: true }),
+    M365: Object.freeze({ ENABLED: false }),
     ACCOUNTING: Object.freeze({ ENABLED: false }),
     DOCUMENTS: Object.freeze({
         DEFAULT_MANAGER_EMAIL: "gestion@marianmadrid.es",

@@ -1,4 +1,13 @@
-﻿export const SECRETS = Object.freeze({
+/*
+=============================================================================
+MODULE: backend/mmSecrets.js
+VERSION: marianmadrid4001 (v21.0.0-LTS-canonical-secrets)
+RESPONSIBILITY: Catalog of Wix Secrets Manager key names.
+STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
+=============================================================================
+*/
+
+export const SECRETS = Object.freeze({
     FISCAL_KEY: "SECRET_FISCAL_KEY",
     FISCAL_NIF_EMISOR: "FISCAL_NIF_EMISOR",
     AUTH_JWT_KEY: "SECRET_AUTH_JWT_KEY",

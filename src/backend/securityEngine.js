@@ -1,7 +1,7 @@
 /*
 =============================================================================
 MODULE: backend/securityEngine.js
-VERSION: marianmadrid4003 (v21.1.0-LTS-remediated-jti-anti-replay)
+VERSION: marianmadrid4004 (v21.1.2-LTS-remediated-jti-anti-replay)
 RESPONSIBILITY: Cryptographic engine: HMAC-SHA256, timing-safe comparison,
             SHA-256 hashing, hash chains, and JWT HS256 tokens with JTI replay prevention.
 STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
@@ -10,8 +10,9 @@ STANDARDS: G10 ASCII Strict (0 non-ASCII characters).
 
 import { createHmac, createHash, timingSafeEqual as cryptoTimingSafeEqual } from "crypto";
 import { getSecret } from "wix-secrets-backend";
+import wixData from "wix-data";
 import { SECRETS } from "backend/mmSecrets";
-import { JWT } from "backend/internalConfig";
+import { JWT, COLLECTIONS } from "backend/internalConfig";
 
 export function hmacSha256Hex(secretKey, payload) {
     return createHmac("sha256", String(secretKey))
@@ -78,13 +79,14 @@ export async function generarToken(payload, traceId) {
     const now = Date.now();
     const expiresAt = now + (JWT.EXPIRATION_MS || 1800000);
     const header = { alg: JWT.ALGORITHM, typ: "JWT" };
+    const jti = `jti_${traceId}_${now}_${createHash("sha256").update(`${traceId}:${now}:${Math.random()}`).digest("hex").slice(0, 12)}`;
     const body = {
         ...payload,
         iss: "marianmadrid.es",
         aud: "marianmadrid-staff",
         iat: Math.floor(now / 1000),
         exp: Math.floor(expiresAt / 1000),
-        jti: `${traceId}-${now}`,
+        jti,
     };
     const encodedHeader = base64UrlEncode(JSON.stringify(header));
     const encodedBody = base64UrlEncode(JSON.stringify(body));
@@ -92,7 +94,7 @@ export async function generarToken(payload, traceId) {
     return `${encodedHeader}.${encodedBody}.${signature}`;
 }
 
-export async function verificarToken(token, _traceId) {
+export async function verificarToken(token, traceId, options = {}) {
     if (!token || typeof token !== "string") return { valid: false, error: "TOKEN_MISSING" };
     const parts = token.split(".");
     if (parts.length !== 3) return { valid: false, error: "TOKEN_MALFORMED" };
@@ -111,6 +113,35 @@ export async function verificarToken(token, _traceId) {
         if (body.iss && body.iss !== "marianmadrid.es") {
             return { valid: false, error: "TOKEN_ISSUER_INVALID" };
         }
+        if (body.aud && body.aud !== "marianmadrid-staff") {
+            return { valid: false, error: "TOKEN_AUDIENCE_INVALID" };
+        }
+
+        if (options.singleUse === true && body.jti) {
+            const jtiLockId = `lk_jwt_${createHash("sha256").update(body.jti).digest("hex")}`;
+            const remainingTtlMs = Math.max(1000, ((body.exp || (nowSec + 1800)) - nowSec + 30) * 1000);
+            try {
+                await wixData.insert(
+                    COLLECTIONS.LOCKS,
+                    {
+                        _id: jtiLockId,
+                        slotKey: body.jti,
+                        traceId: String(traceId || "jwt_verifier"),
+                        expiresAt: new Date(Date.now() + remainingTtlMs),
+                        createdAt: new Date(),
+                        updatedAt: new Date(),
+                    },
+                    { suppressAuth: true }
+                );
+            } catch (lockErr) {
+                const msg = String(lockErr?.message || "");
+                if (msg.includes("WDE0123") || msg.includes("WD_ITEM_ALREADY_EXISTS") || msg.includes("Duplicated")) {
+                    return { valid: false, error: "TOKEN_ALREADY_CONSUMED_OR_REPLAYED" };
+                }
+                return { valid: false, error: "TOKEN_JTI_VERIFICATION_FAILED" };
+            }
+        }
+
         return { valid: true, payload: body };
     } catch (_) {
         return { valid: false, error: "TOKEN_PAYLOAD_INVALID" };
